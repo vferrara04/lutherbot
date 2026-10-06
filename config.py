@@ -1,4 +1,4 @@
-TRACKER = 'W26 Makeup & Fine Tracker'
+TRACKER = 'F26 Makeup & Fine Tracker'
 CHORE_LIST = 'All Chore List'
 SCHEDULE = 'BOT Luther Fall 2026 Chore Schedule'
 
