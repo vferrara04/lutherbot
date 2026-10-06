@@ -1,3 +1,1 @@
-from . import main
-
-main.init()
+"""LutherBot package initialization."""
