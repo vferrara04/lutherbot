@@ -10,7 +10,7 @@ class Database:
     
     # 1. Table Setup
     async def init_tables(self):
-        await self.conn.execute("""
+        await self.conn.executescript("""
             CREATE TABLE IF NOT EXISTS users(
                 uid INTEGER PRIMARY KEY,
                 first_name TEXT NOT NULL,
@@ -25,22 +25,22 @@ class Database:
                 due_day INTEGER DEFAULT NULL
             );
             CREATE TABLE IF NOT EXISTS makeup_chores (
+                mid INTEGER PRIMARY KEY,
                 cid INTEGER,
                 uid INTEGER,
                 status TEXT DEFAULT 'available',
-                proof_url TEXT DEFAULT NULL,
-                week INTEGET NOT NULL,
-                PRIMARY KEY (cid, uid)
+                thread_id INTEGER DEFAULT NULL,
+                week TEXT NOT NULL,
                 FOREIGN KEY (cid) REFERENCES chores ON DELETE CASCADE,
                 FOREIGN KEY (uid) REFERENCES users ON DELETE CASCADE,
                 CONSTRAINT status_check CHECK (status IN ('available', 'claimed', 'under_review', 'rejected', 'completed'))
             );
-            CREATE TABLE IF NOT EXISTS chore_assigments (
+            CREATE TABLE IF NOT EXISTS chore_assignments (
                 cid INTEGER,
                 uid INTEGER,
                 week TEXT NOT NULL,
                 status TEXT DEFAULT 'pending',
-                proof TEXT,
+                thread_id INTEGER DEFAULT NULL,
                 PRIMARY KEY (cid, uid),
                 FOREIGN KEY (cid) REFERENCES chores ON DELETE CASCADE,
                 FOREIGN KEY (uid) REFERENCES users ON DELETE CASCADE,
@@ -49,7 +49,11 @@ class Database:
         """)
         await self.conn.commit()
 
-    # 2. Quesy Methods (Used by Cogs)
+    # 2. Roster and Chores
+    
+    # add data
+    
+    # 3. User queries and Submission
     async def get_user_chores(self, user_id: int, week: str):
         query = """
             SELECT
@@ -57,7 +61,7 @@ class Database:
                 c.title,
                 c.description
             FROM chore_assigments ca, chores c
-            WHERE ca.chore_id = c.cid
+            WHERE ca.cid = c.cid
                 AND ca.uid = ?
                 AND ca.week = ?
                 AND ca.status = 'pending';
@@ -77,8 +81,16 @@ class Database:
             (proof_url, chore_id, user_id)
         )
         await self.conn.commit()
-
-    async def get_missing_chores(self, week: str):
+        
+    # link threads to CA
+    
+    # Chore partners
+        
+    # Review Threads
+    
+    # update status of thread
+    
+     async def get_missing_chores(self, week: str):
         query = """ 
             SELECT u.first_name, u.last_name, c.title, c.hours
             FROM chore_assigments ca, users u, chores c
@@ -90,11 +102,15 @@ class Database:
         
         """
         async with self.conn.execute(
-            query, (week)
+            query, (week,)
         ) as cursor:
             return await cursor.fetchall()
-
-    async def claim_makeup(self, chore_id: int, user_id: int) -> bool:
+            
+    # Makeup Bounties
+    
+    # getall makeups
+    
+     async def claim_makeup(self, chore_id: int, user_id: int) -> bool:
         cursor = await self.conn.execute("""
             UPDATE makeup_chores
             SET uid = ?, status = 'claimed'
@@ -105,15 +121,15 @@ class Database:
             )
         await self.conn.commit()
         return cursor.rowcount > 0
-
-    async def resolve_missed_chores(self, chore_id: int, user_id: int):
-        await self.conn.execute("""
+    
+     async def resolve_missed_chores(self, chore_id: int, user_id: int):
+        await self.conn.executescript("""
             UPDATE makeup_chores
             SET status = 'completed'
                 WHERE uid = ? 
                 AND cid = ?;
             UPDATE users
-            SET missed_chore_hours = GREATEST(0, missed_chore_hours - c.hours)
+            SET missed_chore_hours = MAX(0, missed_chore_hours - c.hours)
             FROM chores c
                 WHERE uid = ? 
                 AND c.cid = ?;
