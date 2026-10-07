@@ -2,3 +2,5 @@
 .venv
 data/
 discord.log
+__pycache__
+.egg-info

@@ -5,6 +5,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from lutherbot import config
+from lutherbot.cogs.helpers import has_manager_role, get_or_fetch_channel
 
 
 def has_food_role():
@@ -17,7 +18,7 @@ def has_food_role():
             )
         else:
             has_role = any(
-                r.name.lower() in ("food", "food manager", "food team")
+                r.name.lower() in ("food", "food manager", "food team", "admin")
                 for r in interaction.user.roles
             )
 
@@ -58,7 +59,7 @@ class AddItemModal(discord.ui.Modal, title="Add to House Shopping List"):
     async def on_submit(self, interaction: discord.Interaction):
         # 1. Insert item into SQLite
         await self.bot.db.add_shopping_item(
-            guild_id=interaction.guild_id,
+            guild_id=interaction.guild_id or 0,
             item_name=self.item_name.value.strip(),
             quantity=self.quantity.value.strip(),
             requested_by=interaction.user.id,
@@ -73,7 +74,7 @@ class AddItemModal(discord.ui.Modal, title="Add to House Shopping List"):
         # 3. Update the public board message in place
         if interaction.message:
             new_embed = await self.board_view.build_shopping_embed(
-                interaction.guild_id
+                interaction.guild_id or 0
             )
             await interaction.message.edit(embed=new_embed, view=self.board_view)
 
@@ -95,10 +96,10 @@ class ShoppingBoardView(discord.ui.View):
             SELECT s.item_name, s.quantity, u.first_name
             FROM shopping_items s
             LEFT JOIN users u ON s.requested_by = u.uid
-            WHERE s.guild_id = ? AND s.status = 'needed'
+            WHERE s.status = 'needed'
             ORDER BY s.id ASC;
         """
-        async with self.bot.db.conn.execute(query, (guild_id,)) as cursor:
+        async with self.bot.db.conn.execute(query) as cursor:
             items = await cursor.fetchall()
 
         embed = discord.Embed(
@@ -164,7 +165,7 @@ class ShoppingBoardView(discord.ui.View):
     async def refresh_click(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
-        new_embed = await self.build_shopping_embed(interaction.guild_id)
+        new_embed = await self.build_shopping_embed(interaction.guild_id or 0)
         await interaction.response.edit_message(embed=new_embed, view=self)
 
 
@@ -177,18 +178,23 @@ class ShoppingCog(commands.Cog):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+    
 
     @app_commands.command(
         name="post_shopping_list",
         description="Spawns the permanent interactive shopping board",
     )
-    @app_commands.default_permissions(administrator=True)
+    @app_commands.default_permissions(manage_guild=True)
+    @has_manager_role()
     async def post_shopping_list(self, interaction: discord.Interaction):
+        print(
+        f"DEBUG: FOOD_REQUEST_CHANNEL_ID is {config.FOOD_REQUEST_CHANNEL_ID} (type: {type(config.FOOD_REQUEST_CHANNEL_ID)})"
+        )
+        food_request_channel = await get_or_fetch_channel(self.bot, config.FOOD_REQUEST_CHANNEL_ID)
         await interaction.response.defer(ephemeral=True)
         view = ShoppingBoardView(self.bot)
-        embed = await view.build_shopping_embed(interaction.guild_id)
-
-        await interaction.channel.send(embed=embed, view=view)
+        embed = await view.build_shopping_embed(interaction.guild_id or 0)
+        await food_request_channel.send(embed=embed, view=view)
         await interaction.followup.send(
             "✅ Shopping board posted!", ephemeral=True
         )
@@ -197,21 +203,14 @@ class ShoppingCog(commands.Cog):
         name="send_shopping_list",
         description="Exports pending grocery items to the private food channel with checkable reactions",
     )
+    @app_commands.default_permissions(manage_guild=True)
     @has_food_role()
     async def send_shopping_list(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
 
-        food_channel = interaction.guild.get_channel(config.FOOD_CHANNEL_ID)
-        if not food_channel:
-            await interaction.followup.send(
-                "❌ Target food channel not found. Check `FOOD_CHANNEL_ID` in your config.",
-                ephemeral=True,
-            )
-            return
-
         # Fetch and archive pending items in SQLite
         items = await self.bot.db.fetch_and_reset_shopping_list(
-            interaction.guild_id
+            interaction.guild_id or 0
         )
         if not items:
             await interaction.followup.send(
@@ -229,6 +228,7 @@ class ShoppingCog(commands.Cog):
             ),
             color=discord.Color.green(),
         )
+        food_channel = await get_or_fetch_channel(self.bot, config.FOOD_CHANNEL_ID)
         await food_channel.send(embed=header_embed)
 
         # 2. Post each item as an individual checklist message
@@ -240,7 +240,7 @@ class ShoppingCog(commands.Cog):
                 f"▫️ **{it['item_name']}** — Qty: `{it['quantity']}`{requester}"
             )
             await msg.add_reaction("✅")
-            await asyncio.sleep(0.25)  # Prevents Discord rate limits
+            await asyncio.sleep(0.25)
 
         await interaction.followup.send(
             f"✅ Sent **{len(items)} items** to {food_channel.mention} and reset the board!",
@@ -257,7 +257,7 @@ class ShoppingCog(commands.Cog):
     ):
         if payload.user_id == self.bot.user.id:
             return
-        if payload.channel_id != config.FOOD_CHANNEL_ID:
+        if config.FOOD_CHANNEL_ID and payload.channel_id != config.FOOD_CHANNEL_ID:
             return
         if str(payload.emoji) != "✅":
             return
@@ -279,7 +279,7 @@ class ShoppingCog(commands.Cog):
     async def on_raw_reaction_remove(
         self, payload: discord.RawReactionActionEvent
     ):
-        if payload.channel_id != config.FOOD_CHANNEL_ID:
+        if config.FOOD_CHANNEL_ID and payload.channel_id != config.FOOD_CHANNEL_ID:
             return
         if str(payload.emoji) != "✅":
             return
@@ -294,7 +294,6 @@ class ShoppingCog(commands.Cog):
             return
 
         reaction = discord.utils.get(message.reactions, emoji="✅")
-        # 1 reaction means only the bot's reaction remains
         if reaction and reaction.count <= 1:
             content = message.content
             if content.startswith("✅ ~~") and content.endswith("~~"):
