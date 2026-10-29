@@ -1,9 +1,74 @@
 # src/lutherbot/cogs/users.py
 from datetime import datetime
+import math
 import discord
 from discord import app_commands
 from discord.ext import commands
 from lutherbot.cogs.helpers import has_manager_role
+
+
+class RosterPaginationView(discord.ui.View):
+    """Paginates the /roster table if there are more than 40 members."""
+
+    def __init__(self, members: list):
+        super().__init__(timeout=120)
+        self.members = members
+        self.page = 0
+        self.per_page = 40
+        self.total_pages = max(1, math.ceil(len(self.members) / self.per_page))
+        self._update_buttons()
+
+    def _update_buttons(self):
+        self.prev_btn.disabled = self.page <= 0
+        self.next_btn.disabled = self.page >= self.total_pages - 1
+
+    def build_embed(self) -> discord.Embed:
+        embed = discord.Embed(
+            title="🏠 House Co-op Roster",
+            color=discord.Color.dark_theme(),
+            timestamp=datetime.utcnow(),
+        )
+        if not self.members:
+            embed.description = "No members registered yet. Use `/register` to sign up!"
+            return embed
+
+        start = self.page * self.per_page
+        chunk = self.members[start : start + self.per_page]
+
+        lines = [
+            f"{'Member':<18} | {'Debt':<6} | {'Discord ID':<18}",
+            "-" * 48,
+        ]
+
+        for m in chunk:
+            full_name = f"{m['first_name']} {m['last_name']}"[:17]
+            debt = f"{m['missed_chore_hours']}h"
+            uid_str = str(m["uid"])
+            lines.append(f"{full_name:<18} | {debt:<6} | {uid_str:<18}")
+
+        embed.description = (
+            f"```text\n{chr(10).join(lines)}\n```\n"
+            f"*Page {self.page + 1}/{self.total_pages} • Total registered: {len(self.members)}*"
+        )
+        return embed
+
+    @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary)
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.page > 0:
+            self.page -= 1
+            self._update_buttons()
+            await interaction.response.edit_message(embed=self.build_embed(), view=self)
+        else:
+            await interaction.response.defer()
+
+    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary)
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.page < self.total_pages - 1:
+            self.page += 1
+            self._update_buttons()
+            await interaction.response.edit_message(embed=self.build_embed(), view=self)
+        else:
+            await interaction.response.defer()
 
 
 class UsersCog(commands.Cog):
@@ -37,11 +102,9 @@ class UsersCog(commands.Cog):
             )
             return
 
-        # Check if user was already in DB
         existing = await self.bot.db.get_user(interaction.user.id)
         current_debt = existing["missed_chore_hours"] if existing else 0
 
-        # Upsert user record
         await self.bot.db.upsert_user(
             user_id=interaction.user.id,
             first_name=first_clean,
@@ -138,31 +201,13 @@ class UsersCog(commands.Cog):
     async def roster(self, interaction: discord.Interaction):
         """Displays the entire housemate roster and debt standings."""
         members = await self.bot.db.get_all_users()
+        view = RosterPaginationView(members)
+        embed = view.build_embed()
 
-        embed = discord.Embed(
-            title="🏠 House Co-op Roster",
-            color=discord.Color.dark_theme(),
-            timestamp=datetime.utcnow(),
-        )
-
-        if not members:
-            embed.description = "No members registered yet. Use `/register` to sign up!"
+        if view.total_pages > 1:
+            await interaction.response.send_message(embed=embed, view=view)
+        else:
             await interaction.response.send_message(embed=embed)
-            return
-
-        lines = [
-            f"{'Member':<18} | {'Debt':<6} | {'Discord ID':<18}",
-            "-" * 48,
-        ]
-
-        for m in members:
-            full_name = f"{m['first_name']} {m['last_name']}"[:17]
-            debt = f"{m['missed_chore_hours']}h"
-            uid_str = str(m["uid"])
-            lines.append(f"{full_name:<18} | {debt:<6} | {uid_str:<18}")
-
-        embed.description = f"```text\n{chr(10).join(lines)}\n```\n*Total registered: {len(members)}*"
-        await interaction.response.send_message(embed=embed)
 
     @app_commands.command(
         name="set_missed_hours",

@@ -12,12 +12,13 @@ from lutherbot.cogs.helpers import (
     get_iso_week,
     get_next_week,
     get_prev_week,
+    get_or_fetch_channel,
+    PaginatedSelectView,
 )
 from lutherbot.cogs.reviews import ThreadReviewView, spawn_review_thread
 from lutherbot.cogs.modals import AddChoreModal, EditChoreModal
 from lutherbot.cogs.chore_views import PartnerPromptView, ChoreManagerView
 from lutherbot.cogs.assignments import WeeklyAssignmentsView, CustomRolloverModal, EditDebtModal
-from lutherbot.cogs.helpers import get_or_fetch_channel
 from lutherbot import config
 
 
@@ -247,9 +248,8 @@ class ChoresCog(commands.Cog):
                 await self._handle_makeup_submission_flow(interaction, claimed_makeups[0])
             return
 
-        # If user has multiple items, let them choose which one to open
         options = []
-        for c in user_chores[:12]:
+        for c in user_chores:
             options.append(
                 discord.SelectOption(
                     label=f"📋 [Assigned] #{c['chore_id']} {c['title'][:32]}",
@@ -257,7 +257,7 @@ class ChoresCog(commands.Cog):
                     description=f"{c['hours']}h assigned task • Status: {c['status']}",
                 )
             )
-        for m in claimed_makeups[:12]:
+        for m in claimed_makeups:
             options.append(
                 discord.SelectOption(
                     label=f"🧹 [Makeup] #{m['mid']} {m['title'][:32]}",
@@ -266,14 +266,7 @@ class ChoresCog(commands.Cog):
                 )
             )
 
-        pick_view = discord.ui.View(timeout=60)
-        task_select = discord.ui.Select(
-            placeholder="Choose task to submit proof for...",
-            options=options,
-        )
-
-        async def task_picked(s_inter: discord.Interaction):
-            val = task_select.values[0]
+        async def task_picked(s_inter: discord.Interaction, val: str):
             if val.startswith("regular_"):
                 selected_cid = int(val.replace("regular_", ""))
                 target_chore = next(c for c in user_chores if c["chore_id"] == selected_cid)
@@ -283,8 +276,11 @@ class ChoresCog(commands.Cog):
                 target_makeup = next(m for m in claimed_makeups if m["mid"] == selected_mid)
                 await self._handle_makeup_submission_flow(s_inter, target_makeup)
 
-        task_select.callback = task_picked
-        pick_view.add_item(task_select)
+        pick_view = PaginatedSelectView(
+            options=options,
+            placeholder="Choose task to submit proof for...",
+            on_select=task_picked,
+        )
         await interaction.response.send_message(
             "Select which assigned chore or claimed makeup bounty you are submitting proof for:",
             view=pick_view,
@@ -448,13 +444,16 @@ class ChoresCog(commands.Cog):
                 inline=False,
             )
         else:
-            for c in chores:
+            # 24 fields max since Debt Hours takes 1 field (25 max total)
+            for c in chores[:24]:
                 status_val = c["status"].upper() if "status" in c.keys() else "PENDING"
                 embed.add_field(
                     name=f"#{c['chore_id']} {c['title']} ({c['hours']}h)",
                     value=f"Status: `{status_val}`",
                     inline=False,
                 )
+            if len(chores) > 24:
+                embed.set_footer(text=f"Showing 24 of {len(chores)} assigned chores.")
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 

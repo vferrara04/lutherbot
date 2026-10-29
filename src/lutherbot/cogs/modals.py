@@ -30,10 +30,11 @@ class AddChoreModal(discord.ui.Modal, title="Add Master House Chore"):
         max_length=15,
     )
 
-    def __init__(self, bot: commands.Bot, parent_view=None):
+    def __init__(self, bot: commands.Bot, parent_view=None, dashboard_message: discord.Message | None = None):
         super().__init__()
         self.bot = bot
         self.parent_view = parent_view
+        self.dashboard_message = dashboard_message
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
@@ -56,18 +57,23 @@ class AddChoreModal(discord.ui.Modal, title="Add Master House Chore"):
             ephemeral=True,
         )
 
-        if self.parent_view and interaction.message:
-            new_embed = await self.parent_view.build_manager_embed()
-            await interaction.message.edit(embed=new_embed, view=self.parent_view)
+        target_msg = self.dashboard_message or interaction.message
+        if self.parent_view and target_msg:
+            try:
+                new_embed = await self.parent_view.build_manager_embed()
+                await target_msg.edit(embed=new_embed, view=self.parent_view)
+            except discord.HTTPException:
+                pass
 
 
 class EditChoreModal(discord.ui.Modal):
 
-    def __init__(self, bot: commands.Bot, chore: dict, parent_view=None):
+    def __init__(self, bot: commands.Bot, chore: dict, parent_view=None, dashboard_message: discord.Message | None = None):
         super().__init__(title=f"Edit Chore #{chore['cid']}")
         self.bot = bot
         self.cid = chore["cid"]
         self.parent_view = parent_view
+        self.dashboard_message = dashboard_message
 
         self.chore_title = discord.ui.TextInput(
             label="Chore Title",
@@ -121,6 +127,10 @@ class EditChoreModal(discord.ui.Modal):
             ephemeral=True,
         )
 
-        if self.parent_view and interaction.message:
-            new_embed = await self.parent_view.build_manager_embed()
-            await interaction.message.edit(embed=new_embed, view=self.parent_view)
+        target_msg = self.dashboard_message or interaction.message
+        if self.parent_view and target_msg:
+            try:
+                new_embed = await self.parent_view.build_manager_embed()
+                await target_msg.edit(embed=new_embed, view=self.parent_view)
+            except discord.HTTPException:
+                pass

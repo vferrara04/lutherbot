@@ -1,5 +1,7 @@
 from datetime import datetime, date, timedelta
 import discord
+import math
+from typing import Callable, Awaitable
 from discord import app_commands
 from lutherbot import config
 import logging
@@ -134,3 +136,87 @@ async def get_or_fetch_channel(
     except discord.HTTPException as e:
         logger.error("HTTP error fetching channel ID %s: %s", channel_id, e)
         return None
+
+class PaginatedSelectView(discord.ui.View):
+    """Universal view that paginates any list of SelectOptions 25 items at a time."""
+
+    def __init__(
+        self,
+        options: list[discord.SelectOption],
+        placeholder: str,
+        on_select: Callable[[discord.Interaction, str], Awaitable[None]],
+        timeout: float = 120,
+    ):
+        super().__init__(timeout=timeout)
+        self.all_options = options
+        self.base_placeholder = placeholder
+        self.on_select = on_select
+        self.page = 0
+        self.per_page = 25
+        self.total_pages = max(1, math.ceil(len(self.all_options) / self.per_page))
+        self._rebuild()
+
+    def _rebuild(self):
+        self.clear_items()
+        start = self.page * self.per_page
+        chunk = self.all_options[start : start + self.per_page]
+
+        if self.total_pages > 1:
+            ph = f"{self.base_placeholder[:110]} (Page {self.page + 1}/{self.total_pages})"
+        else:
+            ph = self.base_placeholder[:150]
+
+        select = discord.ui.Select(
+            placeholder=ph,
+            options=chunk,
+            row=0,
+        )
+        select.callback = self._handle_select
+        self.add_item(select)
+
+        if self.total_pages > 1:
+            prev_btn = discord.ui.Button(
+                label="◀ Prev",
+                style=discord.ButtonStyle.secondary,
+                disabled=(self.page <= 0),
+                row=1,
+            )
+            prev_btn.callback = self._prev_page
+            self.add_item(prev_btn)
+
+            indicator = discord.ui.Button(
+                label=f"Page {self.page + 1}/{self.total_pages}",
+                style=discord.ButtonStyle.secondary,
+                disabled=True,
+                row=1,
+            )
+            self.add_item(indicator)
+
+            next_btn = discord.ui.Button(
+                label="Next ▶",
+                style=discord.ButtonStyle.secondary,
+                disabled=(self.page >= self.total_pages - 1),
+                row=1,
+            )
+            next_btn.callback = self._next_page
+            self.add_item(next_btn)
+
+    async def _prev_page(self, interaction: discord.Interaction):
+        if self.page > 0:
+            self.page -= 1
+            self._rebuild()
+            await interaction.response.edit_message(view=self)
+        else:
+            await interaction.response.defer()
+
+    async def _next_page(self, interaction: discord.Interaction):
+        if self.page < self.total_pages - 1:
+            self.page += 1
+            self._rebuild()
+            await interaction.response.edit_message(view=self)
+        else:
+            await interaction.response.defer()
+
+    async def _handle_select(self, interaction: discord.Interaction):
+        selected_value = interaction.data["values"][0]
+        await self.on_select(interaction, selected_value)

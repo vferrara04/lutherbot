@@ -185,7 +185,6 @@ class PaginatedChoreSelectView(discord.ui.View):
         select_menu.callback = self.select_callback
         self.add_item(select_menu)
 
-        # Only show pagination buttons if there are more than 25 chores
         if self.total_pages > 1:
             prev_btn = discord.ui.Button(
                 label="◀ Prev",
@@ -240,7 +239,12 @@ class PaginatedChoreSelectView(discord.ui.View):
 
         if self.mode == "edit":
             await select_inter.response.send_modal(
-                EditChoreModal(self.bot, dict(chore), self.manager_view)
+                EditChoreModal(
+                    self.bot,
+                    dict(chore),
+                    self.manager_view,
+                    dashboard_message=self.dashboard_message,
+                )
             )
         elif self.mode == "delete":
             await self.bot.db.delete_chore(cid)
@@ -304,7 +308,6 @@ class ChoreManagerView(discord.ui.View):
             return embed
 
         total_pages = max(1, math.ceil(len(chores) / self.per_page))
-        # Clamp current page in case items were deleted
         self.page = max(0, min(self.page, total_pages - 1))
         self._update_nav_buttons(total_pages)
 
@@ -336,7 +339,9 @@ class ChoreManagerView(discord.ui.View):
     async def add_chore_btn(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
-        await interaction.response.send_modal(AddChoreModal(self.bot, self))
+        await interaction.response.send_modal(
+            AddChoreModal(self.bot, self, dashboard_message=interaction.message)
+        )
 
     @discord.ui.button(
         label="Edit Chore",
