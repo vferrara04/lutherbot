@@ -184,7 +184,6 @@ class ShoppingCog(commands.Cog):
         name="post_shopping_list",
         description="Spawns the permanent interactive shopping board",
     )
-    @app_commands.default_permissions(manage_guild=True)
     @has_manager_role()
     async def post_shopping_list(self, interaction: discord.Interaction):
         print(
@@ -203,7 +202,6 @@ class ShoppingCog(commands.Cog):
         name="send_shopping_list",
         description="Exports pending grocery items to the private food channel with checkable reactions",
     )
-    @app_commands.default_permissions(manage_guild=True)
     @has_food_role()
     async def send_shopping_list(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)

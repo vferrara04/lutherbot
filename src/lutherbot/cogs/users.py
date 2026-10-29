@@ -79,7 +79,6 @@ class UsersCog(commands.Cog):
         last_name="Their real last name",
         initial_debt_hours="Starting delinquent debt hours (default: 0)",
     )
-    @app_commands.default_permissions(manage_guild=True)
     @has_manager_role()
     async def add_user(
         self,
@@ -135,7 +134,6 @@ class UsersCog(commands.Cog):
         name="roster",
         description="View all registered housemates and their debt hours",
     )
-    @app_commands.default_permissions(manage_guild=True)
     @has_manager_role()
     async def roster(self, interaction: discord.Interaction):
         """Displays the entire housemate roster and debt standings."""
@@ -175,7 +173,6 @@ class UsersCog(commands.Cog):
         hours="New missed chore debt hours (e.g. 0 to clear, or specific number)",
         reason="Optional reason for the adjustment",
     )
-    @app_commands.default_permissions(manage_guild=True)
     @has_manager_role()
     async def set_missed_hours(
         self,

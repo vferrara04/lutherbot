@@ -593,7 +593,6 @@ class MakeupsCog(commands.Cog):
         description="Manager: Interactive dashboard to manage makeup chore bounties for a week",
     )
     @app_commands.describe(week="Week identifier to manage (e.g. 2026-W41, defaults to current)")
-    @app_commands.default_permissions(manage_guild=True)
     @has_manager_role()
     async def makeup_dashboard(
         self, interaction: discord.Interaction, week: str = ""
@@ -609,7 +608,6 @@ class MakeupsCog(commands.Cog):
     @app_commands.command(
         name="makeup_post_board", description="Spawn the live makeup chore bounty board for members"
     )
-    @app_commands.default_permissions(manage_guild=True)
     @has_manager_role()
     async def makeup_post_board(self, interaction: discord.Interaction):
         makeup_channel = await get_or_fetch_channel(self.bot, config.MAKEUP_CHANNEL_ID)
@@ -626,7 +624,6 @@ class MakeupsCog(commands.Cog):
         chore="Chore template from list (autocomplete by title or select interactively)",
         week="Week identifier (e.g. 2026-W41, default current week)",
     )
-    @app_commands.default_permissions(manage_guild=True)
     @has_manager_role()
     async def makeup_add(
         self,

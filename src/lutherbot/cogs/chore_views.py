@@ -31,7 +31,7 @@ class PartnerPromptView(discord.ui.View):
         is_shared: bool,
     ):
         partner_names = " & Partner" if is_shared else ""
-        thread_title = f"Chore #{self.chore['chore_id']} - {interaction.user.display_name}{partner_names}"
+        thread_title = f"Chore #{self.chore['title']} - {interaction.user.display_name}{partner_names}"
 
         mentions = " ".join(f"<@{uid}>" for uid in target_uids)
         embed = discord.Embed(

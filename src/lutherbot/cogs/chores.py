@@ -34,7 +34,6 @@ class ChoresCog(commands.Cog):
         name="chore_manager",
         description="Manager: Master chore templates definition dashboard",
     )
-    @app_commands.default_permissions(manage_guild=True)
     @has_manager_role()
     async def chore_manager(self, interaction: discord.Interaction):
         worm_channel = await get_or_fetch_channel(self.bot, config.WORM_CHANNEL_ID)
@@ -50,7 +49,6 @@ class ChoresCog(commands.Cog):
         name="assignments_dashboard",
         description="Manager: View and edit active weekly chore assignments for all members",
     )
-    @app_commands.default_permissions(manage_guild=True)
     @has_manager_role()
     async def assignments_dashboard(self, interaction: discord.Interaction):
         worm_channel = await get_or_fetch_channel(self.bot, config.WORM_CHANNEL_ID)
@@ -70,7 +68,6 @@ class ChoresCog(commands.Cog):
         old_week="The departing week (default: current week, e.g. 2026-W41)",
         new_week="The target week to provision (default: next week, e.g. 2026-W42)",
     )
-    @app_commands.default_permissions(manage_guild=True)
     @has_manager_role()
     async def week_rollover(
         self,
@@ -101,7 +98,6 @@ class ChoresCog(commands.Cog):
         name="pending_reviews",
         description="Manager: View all active chore submission threads awaiting review",
     )
-    @app_commands.default_permissions(manage_guild=True)
     @has_manager_role()
     async def pending_reviews(self, interaction: discord.Interaction):
         view = WeeklyAssignmentsView(self.bot)
@@ -118,7 +114,6 @@ class ChoresCog(commands.Cog):
         hours="Credit hours granted",
         due_day="Due day (Sunday, Monday, Tuesday...)",
     )
-    @app_commands.default_permissions(manage_guild=True)
     @has_manager_role()
     async def chore_add(
         self,
@@ -146,7 +141,6 @@ class ChoresCog(commands.Cog):
         description="Manager: Interactively edit an existing chore template",
     )
     @app_commands.describe(chore_id="The chore ID to edit")
-    @app_commands.default_permissions(manage_guild=True)
     @has_manager_role()
     async def chore_edit(self, interaction: discord.Interaction, chore_id: int):
         chore = await self.bot.db.get_chore(chore_id)
@@ -164,7 +158,6 @@ class ChoresCog(commands.Cog):
         description="Manager: Delete a master chore template",
     )
     @app_commands.describe(chore_id="The chore ID to delete")
-    @app_commands.default_permissions(manage_guild=True)
     @has_manager_role()
     async def chore_delete(self, interaction: discord.Interaction, chore_id: int):
         chore = await self.bot.db.get_chore(chore_id)
@@ -190,7 +183,6 @@ class ChoresCog(commands.Cog):
         week="Target week identifier (e.g. 2026-W41, default current)",
         recurring="Save to recurring weekly template (default: True)",
     )
-    @app_commands.default_permissions(manage_guild=True)
     @has_manager_role()
     async def chore_assign(
         self,
