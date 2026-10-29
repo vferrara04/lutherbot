@@ -1,6 +1,5 @@
 # src/lutherbot/cogs/makeups.py
 from datetime import datetime
-import math
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -11,11 +10,94 @@ from lutherbot.cogs.helpers import (
     get_iso_week,
     get_next_week,
     get_prev_week,
-    format_due_day,
-    get_or_fetch_channel,
+    make_chore_options,
+    post_dashboard_to_channel,
+    PaginatedDashboardView,
     PaginatedSelectView,
 )
-from lutherbot.cogs.reviews import ThreadReviewView
+
+
+async def prompt_add_makeup_bounty(
+    interaction: discord.Interaction,
+    bot: commands.Bot,
+    week: str,
+    on_done=None,
+):
+    """Shared flow for selecting a master chore template and spawning it as a makeup bounty."""
+    chores = await bot.db.get_all_chores()
+    if not chores:
+        await interaction.response.send_message(
+            "❌ No master chore templates found! Create chores in `/chore_manager` first.",
+            ephemeral=True,
+        )
+        return
+
+    async def chore_picked(s_inter: discord.Interaction, selected_val: str):
+        cid = int(selected_val)
+        chore = await bot.db.get_chore(cid)
+        mid = await bot.db.add_makeup_chore(cid, week)
+        await s_inter.response.edit_message(
+            content=f"✅ Created Makeup Bounty **#{mid}** (`{chore['title']}` - {chore['hours']}h credit) for week `{week}`!",
+            view=None,
+        )
+        if on_done:
+            await on_done()
+
+    await interaction.response.send_message(
+        f"Select a chore template to spawn as a makeup bounty for week `{week}`:",
+        view=PaginatedSelectView(
+            make_chore_options(chores),
+            "Select a chore template from the list...",
+            chore_picked,
+        ),
+        ephemeral=True,
+    )
+
+
+async def prompt_remove_makeup_bounty(
+    interaction: discord.Interaction,
+    bot: commands.Bot,
+    available: list,
+    on_done=None,
+):
+    """Shared flow for deleting an unclaimed makeup bounty."""
+    if not available:
+        await interaction.response.send_message(
+            "❌ No available (unclaimed) makeup bounties to remove.",
+            ephemeral=True,
+        )
+        return
+
+    options = [
+        discord.SelectOption(
+            label=f"#{m['mid']} {m['title'][:38]}",
+            value=str(m["mid"]),
+            description=f"{m['hours']}h credit • Week: {m['week']}",
+        )
+        for m in available
+    ]
+
+    async def bounty_picked(s_inter: discord.Interaction, selected_val: str):
+        mid = int(selected_val)
+        deleted = await bot.db.delete_makeup_chore(mid)
+        if deleted:
+            await s_inter.response.edit_message(
+                content=f"🗑️ Deleted Makeup Bounty **#{mid}**.",
+                view=None,
+            )
+            if on_done:
+                await on_done()
+        else:
+            await s_inter.response.edit_message(
+                content=f"⚠️ Bounty #{mid} could not be removed (it may have already been claimed).",
+                view=None,
+            )
+
+    await interaction.response.send_message(
+        "Select a bounty to remove:",
+        view=PaginatedSelectView(options, "Select a bounty to delete...", bounty_picked),
+        ephemeral=True,
+    )
 
 
 class ChangeMakeupWeekModal(discord.ui.Modal, title="Switch Dashboard Week"):
@@ -42,28 +124,18 @@ class ChangeMakeupWeekModal(discord.ui.Modal, title="Switch Dashboard Week"):
             )
             return
 
-        self.parent_view.week = new_w
-        self.parent_view.page = 0
-        new_embed = await self.parent_view.build_dashboard_embed()
-        target_msg = self.dashboard_message or interaction.message
-        if target_msg:
-            await target_msg.edit(embed=new_embed, view=self.parent_view)
-        await interaction.response.send_message(f"✅ Switched dashboard to `{new_w}`.", ephemeral=True)
+        await self.parent_view._switch_week(interaction, new_w, self.dashboard_message, is_modal=True)
 
 
-class MakeupDashboardView(discord.ui.View):
+class MakeupDashboardView(PaginatedDashboardView):
     """Manager dashboard for viewing, adding, and removing makeup chore bounties by week."""
 
     def __init__(self, bot: commands.Bot, week: str | None = None):
-        super().__init__(timeout=None)
-        self.bot = bot
+        super().__init__(bot=bot, per_page=20, manager_only=True, timeout=None)
         self.week = week or get_iso_week()
-        self.page = 0
-        self.per_page = 20
 
-    def _update_nav_buttons(self, total_pages: int):
-        self.prev_page_btn.disabled = self.page <= 0
-        self.next_page_btn.disabled = self.page >= total_pages - 1
+    async def build_embed(self, interaction: discord.Interaction | None = None) -> discord.Embed:
+        return await self.build_dashboard_embed()
 
     async def build_dashboard_embed(self) -> discord.Embed:
         makeups = await self.bot.db.get_makeups_by_week(self.week)
@@ -79,38 +151,26 @@ class MakeupDashboardView(discord.ui.View):
         claimed = sum(1 for m in makeups if m["status"] in ("claimed", "under_review"))
         completed = sum(1 for m in makeups if m["status"] == "completed")
 
-        embed.add_field(
-            name="📅 Active Managing Week",
-            value=f"**`{self.week}`**",
-            inline=True,
-        )
+        embed.add_field(name="📅 Active Managing Week", value=f"**`{self.week}`**", inline=True)
         embed.add_field(
             name="📊 Bounty Summary",
             value=f"Total: **{total}** (🟢 {avail} open | 🟡 {claimed} in-progress | ✅ {completed} settled)",
             inline=True,
         )
 
+        chunk, total_pages = self.paginate(makeups)
         if not makeups:
-            self.page = 0
-            self._update_nav_buttons(1)
             embed.description = (
                 f"```text\nNo makeup chore bounties configured for week {self.week}.\n"
                 "Click '➕ Add Bounty' below to select from your master chore templates!\n```"
             )
         else:
-            total_pages = max(1, math.ceil(total / self.per_page))
-            self.page = max(0, min(self.page, total_pages - 1))
-            self._update_nav_buttons(total_pages)
-
-            start = self.page * self.per_page
-            chunk = makeups[start : start + self.per_page]
-
             lines = [
                 f"{'ID':<4} | {'Chore':<22} | {'Hrs':<3} | {'Status':<11} | {'Member'}",
                 "-" * 58,
             ]
             for m in chunk:
-                title = m["title"][:20] if len(m["title"]) > 20 else m["title"]
+                title = m["title"][:20]
                 status_short = m["status"][:10].upper()
                 assignee = (
                     f"{m['first_name']} {m['last_name'][0]}."
@@ -126,6 +186,10 @@ class MakeupDashboardView(discord.ui.View):
 
         return embed
 
+    async def _refresh_board_msg(self, msg: discord.Message | None):
+        if msg:
+            await msg.edit(embed=await self.build_dashboard_embed(), view=self)
+
     @discord.ui.button(
         label="Add Bounty",
         style=discord.ButtonStyle.success,
@@ -133,56 +197,10 @@ class MakeupDashboardView(discord.ui.View):
         custom_id="mkup_dash_add",
         row=0,
     )
-    async def add_bounty_btn(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        if not check_is_manager(interaction.user, interaction.guild):
-            await interaction.response.send_message(
-                "⛔ **Restricted**: Only members with the **Manager** role can add makeup bounties.",
-                ephemeral=True,
-            )
-            return
-
-        chores = await self.bot.db.get_all_chores()
-        if not chores:
-            await interaction.response.send_message(
-                "❌ No master chore templates found! Create chores in `/chore_manager` first.",
-                ephemeral=True,
-            )
-            return
-
-        dashboard_msg = interaction.message
-        options = [
-            discord.SelectOption(
-                label=f"#{c['cid']} {c['title'][:40]}",
-                value=str(c["cid"]),
-                description=f"{c['hours']}h credit • Due: {format_due_day(c['due_day'])}",
-            )
-            for c in chores
-        ]
-
-        async def chore_picked(s_inter: discord.Interaction, selected_val: str):
-            cid = int(selected_val)
-            chore = await self.bot.db.get_chore(cid)
-            mid = await self.bot.db.add_makeup_chore(cid, self.week)
-            await s_inter.response.edit_message(
-                content=f"✅ Added **{chore['title']}** ({chore['hours']}h) as Makeup Bounty **#{mid}** for week `{self.week}`!",
-                view=None,
-            )
-            new_embed = await self.build_dashboard_embed()
-            if dashboard_msg:
-                await dashboard_msg.edit(embed=new_embed, view=self)
-
-        pick_view = PaginatedSelectView(
-            options=options,
-            placeholder="Select a chore template from the list...",
-            on_select=chore_picked,
-        )
-
-        await interaction.response.send_message(
-            f"Select a chore template below to spawn as a makeup bounty for week `{self.week}`:",
-            view=pick_view,
-            ephemeral=True,
+    async def add_bounty_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        msg = interaction.message
+        await prompt_add_makeup_bounty(
+            interaction, self.bot, self.week, on_done=lambda: self._refresh_board_msg(msg)
         )
 
     @discord.ui.button(
@@ -192,63 +210,28 @@ class MakeupDashboardView(discord.ui.View):
         custom_id="mkup_dash_remove",
         row=0,
     )
-    async def remove_bounty_btn(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        if not check_is_manager(interaction.user, interaction.guild):
-            await interaction.response.send_message(
-                "⛔ **Restricted**: Only members with the **Manager** role can remove makeup bounties.",
-                ephemeral=True,
-            )
-            return
-
+    async def remove_bounty_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         makeups = await self.bot.db.get_makeups_by_week(self.week)
         available = [m for m in makeups if m["status"] == "available"]
-        if not available:
-            await interaction.response.send_message(
-                f"❌ No available (unclaimed) makeup bounties to remove for week `{self.week}`.",
-                ephemeral=True,
-            )
-            return
-
-        dashboard_msg = interaction.message
-        options = [
-            discord.SelectOption(
-                label=f"#{m['mid']} {m['title'][:38]}",
-                value=str(m["mid"]),
-                description=f"{m['hours']}h credit • Status: {m['status'].upper()}",
-            )
-            for m in available
-        ]
-
-        async def bounty_picked(s_inter: discord.Interaction, selected_val: str):
-            mid = int(selected_val)
-            deleted = await self.bot.db.delete_makeup_chore(mid)
-            if deleted:
-                await s_inter.response.edit_message(
-                    content=f"🗑️ Deleted Makeup Bounty **#{mid}** from week `{self.week}`.",
-                    view=None,
-                )
-                new_embed = await self.build_dashboard_embed()
-                if dashboard_msg:
-                    await dashboard_msg.edit(embed=new_embed, view=self)
-            else:
-                await s_inter.response.edit_message(
-                    content=f"⚠️ Bounty #{mid} could not be removed (it may have been claimed).",
-                    view=None,
-                )
-
-        pick_view = PaginatedSelectView(
-            options=options,
-            placeholder="Select a bounty to delete...",
-            on_select=bounty_picked,
+        msg = interaction.message
+        await prompt_remove_makeup_bounty(
+            interaction, self.bot, available, on_done=lambda: self._refresh_board_msg(msg)
         )
 
-        await interaction.response.send_message(
-            f"Select a bounty to delete from week `{self.week}`:",
-            view=pick_view,
-            ephemeral=True,
-        )
+    async def _switch_week(
+        self,
+        interaction: discord.Interaction,
+        target_week: str,
+        dashboard_msg: discord.Message | None,
+        is_modal: bool = False,
+    ):
+        self.week = target_week
+        self.page = 0
+        await self._refresh_board_msg(dashboard_msg)
+        if is_modal:
+            await interaction.response.send_message(f"✅ Switched dashboard to `{target_week}`.", ephemeral=True)
+        else:
+            await interaction.response.edit_message(content=f"✅ Switched dashboard to `{target_week}`.", view=None)
 
     @discord.ui.button(
         label="Change Week",
@@ -257,68 +240,22 @@ class MakeupDashboardView(discord.ui.View):
         custom_id="mkup_dash_week",
         row=0,
     )
-    async def change_week_btn(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        if not check_is_manager(interaction.user, interaction.guild):
-            await interaction.response.send_message(
-                "⛔ **Restricted**: Only managers can change the active week.",
-                ephemeral=True,
-            )
-            return
-
+    async def change_week_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         curr_w = get_iso_week()
         next_w = get_next_week(self.week)
         prev_w = get_prev_week(self.week)
         dashboard_msg = interaction.message
 
         week_view = discord.ui.View(timeout=60)
-        btn_curr = discord.ui.Button(label=f"Current ({curr_w})", style=discord.ButtonStyle.secondary)
-
-        async def go_curr(c_inter: discord.Interaction):
-            self.week = curr_w
-            self.page = 0
-            new_embed = await self.build_dashboard_embed()
-            if dashboard_msg:
-                await dashboard_msg.edit(embed=new_embed, view=self)
-            await c_inter.response.edit_message(content=f"✅ Switched dashboard to `{curr_w}`.", view=None)
-
-        btn_curr.callback = go_curr
-        week_view.add_item(btn_curr)
-
-        btn_next = discord.ui.Button(label=f"Next ({next_w})", style=discord.ButtonStyle.secondary)
-
-        async def go_next(n_inter: discord.Interaction):
-            self.week = next_w
-            self.page = 0
-            new_embed = await self.build_dashboard_embed()
-            if dashboard_msg:
-                await dashboard_msg.edit(embed=new_embed, view=self)
-            await n_inter.response.edit_message(content=f"✅ Switched dashboard to `{next_w}`.", view=None)
-
-        btn_next.callback = go_next
-        week_view.add_item(btn_next)
-
-        btn_prev = discord.ui.Button(label=f"Prev ({prev_w})", style=discord.ButtonStyle.secondary)
-
-        async def go_prev(p_inter: discord.Interaction):
-            self.week = prev_w
-            self.page = 0
-            new_embed = await self.build_dashboard_embed()
-            if dashboard_msg:
-                await dashboard_msg.edit(embed=new_embed, view=self)
-            await p_inter.response.edit_message(content=f"✅ Switched dashboard to `{prev_w}`.", view=None)
-
-        btn_prev.callback = go_prev
-        week_view.add_item(btn_prev)
+        for label, wk in [("Current", curr_w), ("Next", next_w), ("Prev", prev_w)]:
+            btn = discord.ui.Button(label=f"{label} ({wk})", style=discord.ButtonStyle.secondary)
+            btn.callback = lambda i, w=wk: self._switch_week(i, w, dashboard_msg)
+            week_view.add_item(btn)
 
         btn_custom = discord.ui.Button(label="Custom Week...", style=discord.ButtonStyle.primary)
-
-        async def go_custom(cust_inter: discord.Interaction):
-            modal = ChangeMakeupWeekModal(self, dashboard_message=dashboard_msg)
-            await cust_inter.response.send_modal(modal)
-
-        btn_custom.callback = go_custom
+        btn_custom.callback = lambda i: i.response.send_modal(
+            ChangeMakeupWeekModal(self, dashboard_message=dashboard_msg)
+        )
         week_view.add_item(btn_custom)
 
         await interaction.response.send_message(
@@ -334,22 +271,15 @@ class MakeupDashboardView(discord.ui.View):
         custom_id="mkup_dash_post_board",
         row=1,
     )
-    async def post_board_btn(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        if not check_is_manager(interaction.user, interaction.guild):
-            await interaction.response.send_message(
-                "⛔ **Restricted**: Only managers can post the bounty board.",
-                ephemeral=True,
-            )
-            return
-        makeup_channel = await get_or_fetch_channel(self.bot, config.MAKEUP_CHANNEL_ID)
+    async def post_board_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         board_view = MakeupBoardView(self.bot)
         board_embed = await board_view.build_board_embed()
-        await makeup_channel.send(embed=board_embed, view=board_view)
-        await interaction.response.send_message(
+        await post_dashboard_to_channel(
+            interaction,
+            config.MAKEUP_CHANNEL_ID,
+            board_view,
+            board_embed,
             "✅ Public Makeup Bounty Board posted to the channel!",
-            ephemeral=True,
         )
 
     @discord.ui.button(
@@ -359,11 +289,8 @@ class MakeupDashboardView(discord.ui.View):
         custom_id="mkup_dash_refresh",
         row=1,
     )
-    async def refresh_btn(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        new_embed = await self.build_dashboard_embed()
-        await interaction.response.edit_message(embed=new_embed, view=self)
+    async def refresh_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._refresh_display(interaction)
 
     @discord.ui.button(
         label="◀ Prev",
@@ -371,13 +298,8 @@ class MakeupDashboardView(discord.ui.View):
         custom_id="mkup_dash_prev_page",
         row=1,
     )
-    async def prev_page_btn(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        if self.page > 0:
-            self.page -= 1
-        new_embed = await self.build_dashboard_embed()
-        await interaction.response.edit_message(embed=new_embed, view=self)
+    async def prev_page_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._turn_page(interaction, -1)
 
     @discord.ui.button(
         label="Next ▶",
@@ -385,26 +307,18 @@ class MakeupDashboardView(discord.ui.View):
         custom_id="mkup_dash_next_page",
         row=1,
     )
-    async def next_page_btn(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        self.page += 1
-        new_embed = await self.build_dashboard_embed()
-        await interaction.response.edit_message(embed=new_embed, view=self)
+    async def next_page_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._turn_page(interaction, 1)
 
 
-class MakeupBoardView(discord.ui.View):
+class MakeupBoardView(PaginatedDashboardView):
     """Public board showing open makeup bounties that indebted housemates can claim."""
 
     def __init__(self, bot: commands.Bot):
-        super().__init__(timeout=None)
-        self.bot = bot
-        self.page = 0
-        self.per_page = 20
+        super().__init__(bot=bot, per_page=20, manager_only=False, timeout=None)
 
-    def _update_nav_buttons(self, total_pages: int):
-        self.prev_page_btn.disabled = self.page <= 0
-        self.next_page_btn.disabled = self.page >= total_pages - 1
+    async def build_embed(self, interaction: discord.Interaction | None = None) -> discord.Embed:
+        return await self.build_board_embed()
 
     async def build_board_embed(self) -> discord.Embed:
         available = await self.bot.db.get_available_makeups()
@@ -415,34 +329,28 @@ class MakeupBoardView(discord.ui.View):
             timestamp=datetime.utcnow(),
         )
 
+        chunk, total_pages = self.paginate(available)
         if not available:
-            self.page = 0
-            self._update_nav_buttons(1)
             embed.description = "```\nNo available makeup chores right now. You're all caught up!\n```"
             return embed
-
-        total = len(available)
-        total_pages = max(1, math.ceil(total / self.per_page))
-        self.page = max(0, min(self.page, total_pages - 1))
-        self._update_nav_buttons(total_pages)
-
-        start = self.page * self.per_page
-        chunk = available[start : start + self.per_page]
 
         lines = [
             f"{'ID':<4} | {'Chore':<24} | {'Hrs':<3} | {'Week':<8}",
             "-" * 45,
         ]
         for m in chunk:
-            title = m["title"][:22] if len(m["title"]) > 22 else m["title"]
-            lines.append(f"{m['mid']:<4} | {title:<24} | {m['hours']:<3} | {m['week']:<8}")
+            lines.append(f"{m['mid']:<4} | {m['title'][:22]:<24} | {m['hours']:<3} | {m['week']:<8}")
 
         embed.description = (
             f"```text\n{chr(10).join(lines)}\n```\n"
-            f"*Page {self.page + 1}/{total_pages} ({total} open bounties) • Claim an open task to work off delinquent missed chore hours.\n"
+            f"*Page {self.page + 1}/{total_pages} ({len(available)} open bounties) • Claim an open task to work off delinquent missed chore hours.\n"
             "Submit proof anytime using `/chore_submit`.*"
         )
         return embed
+
+    async def _refresh_board_msg(self, msg: discord.Message | None):
+        if msg:
+            await msg.edit(embed=await self.build_board_embed(), view=self)
 
     @discord.ui.button(
         label="Claim Bounty",
@@ -451,9 +359,7 @@ class MakeupBoardView(discord.ui.View):
         custom_id="makeup_btn_claim",
         row=0,
     )
-    async def claim_button(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
+    async def claim_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         user = await self.bot.db.get_user(interaction.user.id)
         debt = user["missed_chore_hours"] if user else 0
 
@@ -466,9 +372,7 @@ class MakeupBoardView(discord.ui.View):
 
         available = await self.bot.db.get_available_makeups()
         if not available:
-            await interaction.response.send_message(
-                "There are no makeup chores currently available.", ephemeral=True
-            )
+            await interaction.response.send_message("There are no makeup chores currently available.", ephemeral=True)
             return
 
         board_msg = interaction.message
@@ -498,18 +402,11 @@ class MakeupBoardView(discord.ui.View):
                 ),
                 view=None,
             )
-            new_embed = await self.build_board_embed()
-            if board_msg:
-                await board_msg.edit(embed=new_embed, view=self)
+            await self._refresh_board_msg(board_msg)
 
-        view = PaginatedSelectView(
-            options=options,
-            placeholder="Select a bounty chore to claim...",
-            on_select=claim_selected,
-        )
         await interaction.response.send_message(
             f"You have `{debt} hrs` of missed debt. Pick a chore below:",
-            view=view,
+            view=PaginatedSelectView(options, "Select a bounty chore to claim...", claim_selected),
             ephemeral=True,
         )
 
@@ -520,9 +417,7 @@ class MakeupBoardView(discord.ui.View):
         custom_id="makeup_btn_add_bounty",
         row=0,
     )
-    async def add_bounty_btn(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
+    async def add_bounty_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not check_is_manager(interaction.user, interaction.guild):
             await interaction.response.send_message(
                 "⛔ **Restricted**: Only members with the **Manager** role can post makeup bounties.",
@@ -530,48 +425,9 @@ class MakeupBoardView(discord.ui.View):
             )
             return
 
-        chores = await self.bot.db.get_all_chores()
-        if not chores:
-            await interaction.response.send_message(
-                "❌ No chore templates found. Create some in `/chore_manager` first.",
-                ephemeral=True,
-            )
-            return
-
-        board_msg = interaction.message
-        options = [
-            discord.SelectOption(
-                label=f"#{c['cid']} {c['title'][:40]}",
-                value=str(c["cid"]),
-                description=f"{c['hours']}h credit • Due: {format_due_day(c['due_day'])}",
-            )
-            for c in chores
-        ]
-
-        async def chore_picked(s_inter: discord.Interaction, selected_val: str):
-            cid = int(selected_val)
-            chore = await self.bot.db.get_chore(cid)
-            current_week = get_iso_week()
-
-            mid = await self.bot.db.add_makeup_chore(cid, current_week)
-            await s_inter.response.edit_message(
-                content=f"✅ Created Makeup Bounty **#{mid}** (`{chore['title']}` - {chore['hours']}h credit) for week `{current_week}`!",
-                view=None,
-            )
-            new_embed = await self.build_board_embed()
-            if board_msg:
-                await board_msg.edit(embed=new_embed, view=self)
-
-        select_view = PaginatedSelectView(
-            options=options,
-            placeholder="Pick a chore to spawn as a makeup bounty...",
-            on_select=chore_picked,
-        )
-
-        await interaction.response.send_message(
-            "Select a chore template to add as a makeup bounty:",
-            view=select_view,
-            ephemeral=True,
+        msg = interaction.message
+        await prompt_add_makeup_bounty(
+            interaction, self.bot, get_iso_week(), on_done=lambda: self._refresh_board_msg(msg)
         )
 
     @discord.ui.button(
@@ -581,9 +437,7 @@ class MakeupBoardView(discord.ui.View):
         custom_id="makeup_btn_remove_bounty",
         row=0,
     )
-    async def remove_bounty_btn(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
+    async def remove_bounty_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not check_is_manager(interaction.user, interaction.guild):
             await interaction.response.send_message(
                 "⛔ **Restricted**: Only members with the **Manager** role can remove makeup bounties.",
@@ -592,49 +446,9 @@ class MakeupBoardView(discord.ui.View):
             return
 
         available = await self.bot.db.get_available_makeups()
-        if not available:
-            await interaction.response.send_message(
-                "❌ No available makeup bounties to remove.", ephemeral=True
-            )
-            return
-
-        board_msg = interaction.message
-        options = [
-            discord.SelectOption(
-                label=f"#{m['mid']} {m['title'][:40]}",
-                value=str(m["mid"]),
-                description=f"{m['hours']}h credit • Week: {m['week']}",
-            )
-            for m in available
-        ]
-
-        async def bounty_picked(s_inter: discord.Interaction, selected_val: str):
-            mid = int(selected_val)
-            deleted = await self.bot.db.delete_makeup_chore(mid)
-            if deleted:
-                await s_inter.response.edit_message(
-                    content=f"🗑️ Removed Makeup Bounty **#{mid}** from the board.",
-                    view=None,
-                )
-                new_embed = await self.build_board_embed()
-                if board_msg:
-                    await board_msg.edit(embed=new_embed, view=self)
-            else:
-                await s_inter.response.edit_message(
-                    content=f"⚠️ Bounty #{mid} could not be removed (it may have already been claimed).",
-                    view=None,
-                )
-
-        select_view = PaginatedSelectView(
-            options=options,
-            placeholder="Select a bounty to delete from the board...",
-            on_select=bounty_picked,
-        )
-
-        await interaction.response.send_message(
-            "Select a bounty to remove:",
-            view=select_view,
-            ephemeral=True,
+        msg = interaction.message
+        await prompt_remove_makeup_bounty(
+            interaction, self.bot, available, on_done=lambda: self._refresh_board_msg(msg)
         )
 
     @discord.ui.button(
@@ -644,11 +458,8 @@ class MakeupBoardView(discord.ui.View):
         custom_id="makeup_btn_refresh",
         row=1,
     )
-    async def refresh_board(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        new_embed = await self.build_board_embed()
-        await interaction.response.edit_message(embed=new_embed, view=self)
+    async def refresh_board(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._refresh_display(interaction)
 
     @discord.ui.button(
         label="◀ Prev",
@@ -656,13 +467,8 @@ class MakeupBoardView(discord.ui.View):
         custom_id="makeup_btn_prev_page",
         row=1,
     )
-    async def prev_page_btn(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        if self.page > 0:
-            self.page -= 1
-        new_embed = await self.build_board_embed()
-        await interaction.response.edit_message(embed=new_embed, view=self)
+    async def prev_page_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._turn_page(interaction, -1)
 
     @discord.ui.button(
         label="Next ▶",
@@ -670,12 +476,8 @@ class MakeupBoardView(discord.ui.View):
         custom_id="makeup_btn_next_page",
         row=1,
     )
-    async def next_page_btn(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        self.page += 1
-        new_embed = await self.build_board_embed()
-        await interaction.response.edit_message(embed=new_embed, view=self)
+    async def next_page_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._turn_page(interaction, 1)
 
 
 class MakeupsCog(commands.Cog):
@@ -689,55 +491,42 @@ class MakeupsCog(commands.Cog):
     )
     @app_commands.describe(week="Week identifier to manage (e.g. 2026-W41, defaults to current)")
     @has_manager_role()
-    async def makeup_dashboard(
-        self, interaction: discord.Interaction, week: str = ""
-    ):
-        worm_channel = await get_or_fetch_channel(self.bot, config.WORM_CHANNEL_ID)
-        await interaction.response.defer(ephemeral=True)
+    async def makeup_dashboard(self, interaction: discord.Interaction, week: str = ""):
         target_week = week.strip().upper() if week else get_iso_week()
         view = MakeupDashboardView(self.bot, week=target_week)
         embed = await view.build_dashboard_embed()
-        await worm_channel.send(embed=embed, view=view)
-        await interaction.followup.send("✅ Makeup Chores Dashboard posted!", ephemeral=True)
+        await post_dashboard_to_channel(
+            interaction, config.WORM_CHANNEL_ID, view, embed, "✅ Makeup Chores Dashboard posted!"
+        )
 
     @app_commands.command(
-        name="makeup_post_board", description="Spawn the live makeup chore bounty board for members"
+        name="makeup_post_board",
+        description="Spawn the live makeup chore bounty board for members",
     )
     @has_manager_role()
     async def makeup_post_board(self, interaction: discord.Interaction):
-        makeup_channel = await get_or_fetch_channel(self.bot, config.MAKEUP_CHANNEL_ID)
-        await interaction.response.defer(ephemeral=True)
         view = MakeupBoardView(self.bot)
         embed = await view.build_board_embed()
-        await makeup_channel.send(embed=embed, view=view)
-        await interaction.followup.send("✅ Makeup board posted!", ephemeral=True)
+        await post_dashboard_to_channel(
+            interaction, config.MAKEUP_CHANNEL_ID, view, embed, "✅ Makeup board posted!"
+        )
 
     @app_commands.command(
-        name="makeup_add", description="Manager: Add a chore template to the makeup pool for a week"
+        name="makeup_add",
+        description="Manager: Add a chore template to the makeup pool for a week",
     )
     @app_commands.describe(
         chore="Chore template from list (autocomplete by title or select interactively)",
         week="Week identifier (e.g. 2026-W41, default current week)",
     )
     @has_manager_role()
-    async def makeup_add(
-        self,
-        interaction: discord.Interaction,
-        chore: str = "",
-        week: str = "",
-    ):
+    async def makeup_add(self, interaction: discord.Interaction, chore: str = "", week: str = ""):
         target_week = week.strip().upper() if week else get_iso_week()
 
         if chore:
-            cid = None
-            if chore.isdigit():
-                cid = int(chore)
-            elif chore.startswith("#"):
-                parts = chore[1:].split(maxsplit=1)
-                if parts[0].isdigit():
-                    cid = int(parts[0])
-
-            if cid is not None:
+            cleaned = chore.lstrip("#").split(maxsplit=1)[0]
+            if cleaned.isdigit():
+                cid = int(cleaned)
                 chore_obj = await self.bot.db.get_chore(cid)
                 if chore_obj:
                     mid = await self.bot.db.add_makeup_chore(cid=cid, week=target_week)
@@ -747,42 +536,7 @@ class MakeupsCog(commands.Cog):
                     )
                     return
 
-        chores = await self.bot.db.get_all_chores()
-        if not chores:
-            await interaction.response.send_message(
-                "❌ No master chore templates found. Create chores in `/chore_manager` first.",
-                ephemeral=True,
-            )
-            return
-
-        options = [
-            discord.SelectOption(
-                label=f"#{c['cid']} {c['title'][:40]}",
-                value=str(c["cid"]),
-                description=f"{c['hours']}h credit • Due: {format_due_day(c['due_day'])}",
-            )
-            for c in chores
-        ]
-
-        async def chore_picked(s_inter: discord.Interaction, selected_val: str):
-            sel_cid = int(selected_val)
-            c_data = await self.bot.db.get_chore(sel_cid)
-            mid = await self.bot.db.add_makeup_chore(sel_cid, target_week)
-            await s_inter.response.edit_message(
-                content=f"✅ Created Makeup Bounty **#{mid}** (`{c_data['title']}` - {c_data['hours']}h credit) for week `{target_week}`!",
-                view=None,
-            )
-
-        pick_view = PaginatedSelectView(
-            options=options,
-            placeholder="Select a chore template to spawn as a bounty...",
-            on_select=chore_picked,
-        )
-        await interaction.response.send_message(
-            f"Select a chore from the list to add as a makeup bounty for week `{target_week}`:",
-            view=pick_view,
-            ephemeral=True,
-        )
+        await prompt_add_makeup_bounty(interaction, self.bot, target_week)
 
     @makeup_add.autocomplete("chore")
     async def makeup_add_chore_autocomplete(
@@ -792,7 +546,7 @@ class MakeupsCog(commands.Cog):
         results = []
         for c in chores:
             display = f"#{c['cid']} {c['title']} ({c['hours']}h)"
-            if current.lower() in display.lower() or not current:
+            if not current or current.lower() in display.lower():
                 results.append(app_commands.Choice(name=display[:100], value=str(c["cid"])))
             if len(results) >= 25:
                 break

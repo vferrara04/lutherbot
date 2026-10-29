@@ -20,22 +20,7 @@ class ThreadReviewView(discord.ui.View):
             return False
         return True
 
-    @discord.ui.button(
-        label="Approve",
-        style=discord.ButtonStyle.success,
-        emoji="✅",
-        custom_id="chore_review_approve",
-    )
-    async def approve(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        if not check_is_manager(interaction.user, interaction.guild):
-            await interaction.response.send_message(
-                "⛔ **Restricted**: Only members with the **Manager** role can approve chore submissions.",
-                ephemeral=True,
-            )
-            return
-
+    async def _resolve_review(self, interaction: discord.Interaction, approved: bool):
         thread = interaction.channel
         db = interaction.client.db
 
@@ -46,27 +31,44 @@ class ThreadReviewView(discord.ui.View):
             )
             return
 
-        await db.update_status_by_thread(thread.id, "approved")
+        status = "approved" if approved else "rejected"
+        await db.update_status_by_thread(thread.id, status)
 
-        for row in assignments:
-            if row["chore_type"] == "makeup" and row["mid"] is not None:
-                await db.resolve_missed_chores(row["mid"], row["uid"])
+        if approved:
+            for row in assignments:
+                if row["chore_type"] == "makeup" and row["mid"] is not None:
+                    await db.resolve_missed_chores(row["mid"], row["uid"])
 
         for child in self.children:
             child.disabled = True
 
         embed = interaction.message.embeds[0]
-        embed.color = discord.Color.green()
-        embed.title = "✅ Approved"
+        embed.color = discord.Color.green() if approved else discord.Color.red()
+        embed.title = "✅ Approved" if approved else "❌ Rejected - Changes Required"
+        action_label = "Approved" if approved else "Rejected"
         embed.set_footer(
-            text=f"Approved by {interaction.user.display_name} • {datetime.now().strftime('%b %d, %H:%M')}"
+            text=f"{action_label} by {interaction.user.display_name} • {datetime.now().strftime('%b %d, %H:%M')}"
         )
 
         await interaction.response.edit_message(embed=embed, view=self)
-        await thread.send(
-            "🎉 **Submission approved!** Archiving and locking ticket..."
-        )
-        await thread.edit(locked=True, archived=True)
+
+        if approved:
+            await thread.send("🎉 **Submission approved!** Archiving and locking ticket...")
+            await thread.edit(locked=True, archived=True)
+        else:
+            mentions = " ".join(f"<@{row['uid']}>" for row in assignments)
+            await thread.send(
+                f"⚠️ {mentions} Your proof was rejected. Please review manager feedback, redo the task, and upload new photos here."
+            )
+
+    @discord.ui.button(
+        label="Approve",
+        style=discord.ButtonStyle.success,
+        emoji="✅",
+        custom_id="chore_review_approve",
+    )
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._resolve_review(interaction, approved=True)
 
     @discord.ui.button(
         label="Reject",
@@ -74,44 +76,9 @@ class ThreadReviewView(discord.ui.View):
         emoji="❌",
         custom_id="chore_review_reject",
     )
-    async def reject(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        if not check_is_manager(interaction.user, interaction.guild):
-            await interaction.response.send_message(
-                "⛔ **Restricted**: Only members with the **Manager** role can reject chore submissions.",
-                ephemeral=True,
-            )
-            return
+    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._resolve_review(interaction, approved=False)
 
-        thread = interaction.channel
-        db = interaction.client.db
-
-        assignments = await db.get_assignment_by_thread(thread.id)
-        if not assignments:
-            await interaction.response.send_message(
-                "❌ No assignment found.", ephemeral=True
-            )
-            return
-
-        await db.update_status_by_thread(thread.id, "rejected")
-
-        for child in self.children:
-            child.disabled = True
-
-        embed = interaction.message.embeds[0]
-        embed.color = discord.Color.red()
-        embed.title = "❌ Rejected - Changes Required"
-        embed.set_footer(
-            text=f"Rejected by {interaction.user.display_name} • {datetime.now().strftime('%b %d, %H:%M')}"
-        )
-
-        await interaction.response.edit_message(embed=embed, view=self)
-
-        mentions = " ".join(f"<@{row['uid']}>" for row in assignments)
-        await thread.send(
-            f"⚠️ {mentions} Your proof was rejected. Please review manager feedback, redo the task, and upload new photos here."
-        )
 
 async def spawn_review_thread(
     interaction: discord.Interaction,
@@ -132,7 +99,6 @@ async def spawn_review_thread(
         )
         return post.thread, None
 
-    # TextChannel fallback
     thread = await channel.create_thread(
         name=thread_title[:100],
         type=discord.ChannelType.public_thread,

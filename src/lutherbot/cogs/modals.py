@@ -4,98 +4,53 @@ from discord.ext import commands
 from lutherbot.cogs.helpers import format_due_day, parse_due_day
 
 
-class AddChoreModal(discord.ui.Modal, title="Add Master House Chore"):
-    chore_title = discord.ui.TextInput(
-        label="Chore Title",
-        placeholder="e.g. Kitchen Deep Clean",
-        max_length=60,
-    )
-    description = discord.ui.TextInput(
-        label="Checklist / Instructions",
-        placeholder="Wipe counters, sanitize sink, take out compost...",
-        style=discord.TextStyle.paragraph,
-        max_length=300,
-        required=False,
-    )
-    hours = discord.ui.TextInput(
-        label="Credit Hours",
-        placeholder="2",
-        default="1",
-        max_length=3,
-    )
-    due_day = discord.ui.TextInput(
-        label="Due Day of Week",
-        placeholder="e.g. Sunday, Monday, Tuesday... (or blank)",
-        required=False,
-        max_length=15,
-    )
+class ChoreModal(discord.ui.Modal):
+    """Unified modal for creating or editing a master chore template."""
 
-    def __init__(self, bot: commands.Bot, parent_view=None, dashboard_message: discord.Message | None = None):
-        super().__init__()
-        self.bot = bot
-        self.parent_view = parent_view
-        self.dashboard_message = dashboard_message
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            hrs = max(1, int(self.hours.value.strip()))
-        except ValueError:
-            hrs = 1
-
-        day = parse_due_day(self.due_day.value) if self.due_day.value.strip() else None
-
-        cid = await self.bot.db.add_chore(
-            title=self.chore_title.value.strip(),
-            description=self.description.value.strip(),
-            hours=hrs,
-            due_day=day,
+    def __init__(
+        self,
+        bot: commands.Bot,
+        chore: dict | None = None,
+        parent_view=None,
+        dashboard_message: discord.Message | None = None,
+    ):
+        is_edit = chore is not None
+        super().__init__(
+            title=f"Edit Chore #{chore['cid']}" if is_edit else "Add Master House Chore"
         )
-
-        day_text = format_due_day(day)
-        await interaction.response.send_message(
-            f"✅ Created Chore **#{cid}**: `{self.chore_title.value}` ({hrs}h credit, Due: **{day_text}**)!",
-            ephemeral=True,
-        )
-
-        target_msg = self.dashboard_message or interaction.message
-        if self.parent_view and target_msg:
-            try:
-                new_embed = await self.parent_view.build_manager_embed()
-                await target_msg.edit(embed=new_embed, view=self.parent_view)
-            except discord.HTTPException:
-                pass
-
-
-class EditChoreModal(discord.ui.Modal):
-
-    def __init__(self, bot: commands.Bot, chore: dict, parent_view=None, dashboard_message: discord.Message | None = None):
-        super().__init__(title=f"Edit Chore #{chore['cid']}")
         self.bot = bot
-        self.cid = chore["cid"]
+        self.chore = chore
         self.parent_view = parent_view
         self.dashboard_message = dashboard_message
 
         self.chore_title = discord.ui.TextInput(
             label="Chore Title",
-            default=chore["title"],
+            placeholder="e.g. Kitchen Deep Clean",
+            default=chore["title"] if is_edit else "",
             max_length=60,
         )
         self.description = discord.ui.TextInput(
             label="Checklist / Instructions",
-            default=chore["description"] or "",
+            placeholder="Wipe counters, sanitize sink, take out compost...",
+            default=(chore["description"] or "") if is_edit else "",
             style=discord.TextStyle.paragraph,
             max_length=300,
             required=False,
         )
         self.hours = discord.ui.TextInput(
             label="Credit Hours",
-            default=str(chore["hours"]),
+            placeholder="2",
+            default=str(chore["hours"]) if is_edit else "1",
             max_length=3,
         )
         self.due_day = discord.ui.TextInput(
             label="Due Day of Week",
-            default="" if chore["due_day"] is None else format_due_day(chore["due_day"]),
-            placeholder="e.g. Sunday, Monday...",
+            placeholder="e.g. Sunday, Monday, Tuesday... (or blank)",
+            default=(
+                ""
+                if not is_edit or chore["due_day"] is None
+                else format_due_day(chore["due_day"])
+            ),
             required=False,
             max_length=15,
         )
@@ -112,20 +67,30 @@ class EditChoreModal(discord.ui.Modal):
             hrs = 1
 
         day = parse_due_day(self.due_day.value) if self.due_day.value.strip() else None
-
-        await self.bot.db.edit_chore(
-            cid=self.cid,
-            title=self.chore_title.value.strip(),
-            description=self.description.value.strip(),
-            hours=hrs,
-            due_day=day,
-        )
-
+        title_clean = self.chore_title.value.strip()
+        desc_clean = self.description.value.strip()
         day_text = format_due_day(day)
-        await interaction.response.send_message(
-            f"✅ Updated Chore **#{self.cid}**: `{self.chore_title.value}` ({hrs}h credit, Due: **{day_text}**)!",
-            ephemeral=True,
-        )
+
+        if self.chore is None:
+            cid = await self.bot.db.add_chore(
+                title=title_clean,
+                description=desc_clean,
+                hours=hrs,
+                due_day=day,
+            )
+            action_msg = f"✅ Created Chore **#{cid}**: `{title_clean}` ({hrs}h credit, Due: **{day_text}**)!"
+        else:
+            cid = self.chore["cid"]
+            await self.bot.db.edit_chore(
+                cid=cid,
+                title=title_clean,
+                description=desc_clean,
+                hours=hrs,
+                due_day=day,
+            )
+            action_msg = f"✅ Updated Chore **#{cid}**: `{title_clean}` ({hrs}h credit, Due: **{day_text}**)!"
+
+        await interaction.response.send_message(action_msg, ephemeral=True)
 
         target_msg = self.dashboard_message or interaction.message
         if self.parent_view and target_msg:
@@ -134,3 +99,13 @@ class EditChoreModal(discord.ui.Modal):
                 await target_msg.edit(embed=new_embed, view=self.parent_view)
             except discord.HTTPException:
                 pass
+
+
+class AddChoreModal(ChoreModal):
+    def __init__(self, bot: commands.Bot, parent_view=None, dashboard_message: discord.Message | None = None):
+        super().__init__(bot, chore=None, parent_view=parent_view, dashboard_message=dashboard_message)
+
+
+class EditChoreModal(ChoreModal):
+    def __init__(self, bot: commands.Bot, chore: dict, parent_view=None, dashboard_message: discord.Message | None = None):
+        super().__init__(bot, chore=chore, parent_view=parent_view, dashboard_message=dashboard_message)

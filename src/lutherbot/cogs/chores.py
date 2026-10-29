@@ -5,20 +5,22 @@ from discord import app_commands
 from discord.ext import commands
 
 from lutherbot.cogs.helpers import (
-    check_is_manager,
     has_manager_role,
     format_due_day,
     parse_due_day,
     get_iso_week,
     get_next_week,
-    get_prev_week,
-    get_or_fetch_channel,
+    send_or_edit,
+    make_jump_view,
+    ensure_user_registered,
+    chore_autocomplete,
+    post_dashboard_to_channel,
     PaginatedSelectView,
 )
 from lutherbot.cogs.reviews import ThreadReviewView, spawn_review_thread
-from lutherbot.cogs.modals import AddChoreModal, EditChoreModal
+from lutherbot.cogs.modals import EditChoreModal
 from lutherbot.cogs.chore_views import PartnerPromptView, ChoreManagerView
-from lutherbot.cogs.assignments import WeeklyAssignmentsView, CustomRolloverModal, EditDebtModal
+from lutherbot.cogs.assignments import WeeklyAssignmentsView
 from lutherbot import config
 
 
@@ -31,19 +33,21 @@ class ChoresCog(commands.Cog):
         return get_iso_week()
 
     # --- Manager Dashboards ---
+
     @app_commands.command(
         name="chore_manager",
         description="Manager: Master chore templates definition dashboard",
     )
     @has_manager_role()
     async def chore_manager(self, interaction: discord.Interaction):
-        worm_channel = await get_or_fetch_channel(self.bot, config.WORM_CHANNEL_ID)
-        await interaction.response.defer(ephemeral=True)
         view = ChoreManagerView(self.bot)
         embed = await view.build_manager_embed()
-        await worm_channel.send(embed=embed, view=view)
-        await interaction.followup.send(
-            "✅ Master chore templates dashboard posted!", ephemeral=True
+        await post_dashboard_to_channel(
+            interaction,
+            config.WORM_CHANNEL_ID,
+            view,
+            embed,
+            "✅ Master chore templates dashboard posted!",
         )
 
     @app_commands.command(
@@ -52,13 +56,14 @@ class ChoresCog(commands.Cog):
     )
     @has_manager_role()
     async def assignments_dashboard(self, interaction: discord.Interaction):
-        worm_channel = await get_or_fetch_channel(self.bot, config.WORM_CHANNEL_ID)
-        await interaction.response.defer(ephemeral=True)
         view = WeeklyAssignmentsView(self.bot)
         embed = await view.build_assignments_embed()
-        await worm_channel.send(embed=embed, view=view)
-        await interaction.followup.send(
-            "✅ Weekly chore assignments dashboard posted!", ephemeral=True
+        await post_dashboard_to_channel(
+            interaction,
+            config.WORM_CHANNEL_ID,
+            view,
+            embed,
+            "✅ Weekly chore assignments dashboard posted!",
         )
 
     @app_commands.command(
@@ -76,8 +81,7 @@ class ChoresCog(commands.Cog):
         old_week: str = "",
         new_week: str = "",
     ):
-        current_w = self._get_current_week()
-        src_w = old_week.strip().upper() if old_week else current_w
+        src_w = old_week.strip().upper() if old_week else self._get_current_week()
         tgt_w = new_week.strip().upper() if new_week else get_next_week(src_w)
 
         await interaction.response.defer(ephemeral=True)
@@ -105,6 +109,7 @@ class ChoresCog(commands.Cog):
         await view._show_pending_reviews(interaction)
 
     # --- Direct Manager Commands ---
+
     @app_commands.command(
         name="chore_add",
         description="Manager: Add a master chore template",
@@ -131,9 +136,8 @@ class ChoresCog(commands.Cog):
             hours=max(1, hours),
             due_day=day_int,
         )
-        day_text = format_due_day(day_int)
         await interaction.response.send_message(
-            f"✅ Created Chore **#{cid}**: `{title}` ({hours}h credit, Due: **{day_text}**)!",
+            f"✅ Created Chore **#{cid}**: `{title}` ({hours}h credit, Due: **{format_due_day(day_int)}**)!",
             ephemeral=True,
         )
 
@@ -141,31 +145,27 @@ class ChoresCog(commands.Cog):
         name="chore_edit",
         description="Manager: Interactively edit an existing chore template",
     )
-    @app_commands.describe(chore_id="The chore ID to edit")
+    @app_commands.describe(chore_id="The chore to edit")
+    @app_commands.autocomplete(chore_id=chore_autocomplete)
     @has_manager_role()
     async def chore_edit(self, interaction: discord.Interaction, chore_id: int):
         chore = await self.bot.db.get_chore(chore_id)
         if not chore:
-            await interaction.response.send_message(
-                f"❌ Chore template `#{chore_id}` not found.", ephemeral=True
-            )
+            await interaction.response.send_message(f"❌ Chore template `#{chore_id}` not found.", ephemeral=True)
             return
-
-        modal = EditChoreModal(self.bot, dict(chore))
-        await interaction.response.send_modal(modal)
+        await interaction.response.send_modal(EditChoreModal(self.bot, dict(chore)))
 
     @app_commands.command(
         name="chore_delete",
         description="Manager: Delete a master chore template",
     )
-    @app_commands.describe(chore_id="The chore ID to delete")
+    @app_commands.describe(chore_id="The chore to delete")
+    @app_commands.autocomplete(chore_id=chore_autocomplete)
     @has_manager_role()
     async def chore_delete(self, interaction: discord.Interaction, chore_id: int):
         chore = await self.bot.db.get_chore(chore_id)
         if not chore:
-            await interaction.response.send_message(
-                f"❌ Chore template `#{chore_id}` not found.", ephemeral=True
-            )
+            await interaction.response.send_message(f"❌ Chore template `#{chore_id}` not found.", ephemeral=True)
             return
 
         await self.bot.db.delete_chore(chore_id)
@@ -179,11 +179,12 @@ class ChoresCog(commands.Cog):
         description="Manager: Assign a chore to a housemate",
     )
     @app_commands.describe(
-        chore_id="Chore ID to assign",
+        chore_id="Chore to assign",
         member="Housemate to assign chore to",
         week="Target week identifier (e.g. 2026-W41, default current)",
         recurring="Save to recurring weekly template (default: True)",
     )
+    @app_commands.autocomplete(chore_id=chore_autocomplete)
     @has_manager_role()
     async def chore_assign(
         self,
@@ -195,20 +196,11 @@ class ChoresCog(commands.Cog):
     ):
         chore = await self.bot.db.get_chore(chore_id)
         if not chore:
-            await interaction.response.send_message(
-                f"❌ Chore `#{chore_id}` does not exist.", ephemeral=True
-            )
+            await interaction.response.send_message(f"❌ Chore `#{chore_id}` does not exist.", ephemeral=True)
             return
 
         target_week = week if week else self._get_current_week()
-
-        db_user = await self.bot.db.get_user(member.id)
-        if not db_user:
-            name_parts = member.display_name.split()
-            f_name = name_parts[0] if name_parts else member.name
-            l_name = " ".join(name_parts[1:]) if len(name_parts) > 1 else ""
-            await self.bot.db.upsert_user(member.id, f_name, l_name, 0)
-
+        await ensure_user_registered(self.bot.db, member)
         await self.bot.db.assign_chore(chore_id, member.id, target_week)
         if recurring:
             await self.bot.db.add_chore_template(chore_id, member.id)
@@ -220,15 +212,12 @@ class ChoresCog(commands.Cog):
         )
 
     # --- Public Member Commands ---
+
     @app_commands.command(
         name="chore_submit",
         description="Submit proof for your assigned chore or claimed makeup bounty",
     )
     async def submit_chores(self, interaction: discord.Interaction):
-        """Dedicated command allowing any member to submit proof or jump straight into their review thread."""
-        await self._submit_chores_handler(interaction)
-
-    async def _submit_chores_handler(self, interaction: discord.Interaction):
         week = self._get_current_week()
         user_chores = await self.bot.db.get_user_chores(interaction.user.id, week)
         claimed_makeups = await self.bot.db.get_user_claimed_makeups(interaction.user.id)
@@ -248,23 +237,21 @@ class ChoresCog(commands.Cog):
                 await self._handle_makeup_submission_flow(interaction, claimed_makeups[0])
             return
 
-        options = []
-        for c in user_chores:
-            options.append(
-                discord.SelectOption(
-                    label=f"📋 [Assigned] #{c['chore_id']} {c['title'][:32]}",
-                    value=f"regular_{c['chore_id']}",
-                    description=f"{c['hours']}h assigned task • Status: {c['status']}",
-                )
+        options = [
+            discord.SelectOption(
+                label=f"📋 [Assigned] #{c['chore_id']} {c['title'][:32]}",
+                value=f"regular_{c['chore_id']}",
+                description=f"{c['hours']}h assigned task • Status: {c['status']}",
             )
-        for m in claimed_makeups:
-            options.append(
-                discord.SelectOption(
-                    label=f"🧹 [Makeup] #{m['mid']} {m['title'][:32]}",
-                    value=f"makeup_{m['mid']}",
-                    description=f"{m['hours']}h bounty credit • Week: {m['week']}",
-                )
+            for c in user_chores
+        ] + [
+            discord.SelectOption(
+                label=f"🧹 [Makeup] #{m['mid']} {m['title'][:32]}",
+                value=f"makeup_{m['mid']}",
+                description=f"{m['hours']}h bounty credit • Week: {m['week']}",
             )
+            for m in claimed_makeups
+        ]
 
         async def task_picked(s_inter: discord.Interaction, val: str):
             if val.startswith("regular_"):
@@ -276,37 +263,26 @@ class ChoresCog(commands.Cog):
                 target_makeup = next(m for m in claimed_makeups if m["mid"] == selected_mid)
                 await self._handle_makeup_submission_flow(s_inter, target_makeup)
 
-        pick_view = PaginatedSelectView(
-            options=options,
-            placeholder="Choose task to submit proof for...",
-            on_select=task_picked,
-        )
         await interaction.response.send_message(
             "Select which assigned chore or claimed makeup bounty you are submitting proof for:",
-            view=pick_view,
+            view=PaginatedSelectView(options, "Choose task to submit proof for...", task_picked),
             ephemeral=True,
+        )
+
+    async def _send_existing_thread_link(self, interaction: discord.Interaction, thread_id: int, label_prefix: str):
+        thread = interaction.guild.get_thread(thread_id) if interaction.guild else None
+        jump_url = thread.jump_url if thread else f"https://discord.com/channels/{interaction.guild_id}/{thread_id}"
+        await send_or_edit(
+            interaction,
+            f"📋 **Your thread is already open for {label_prefix}!** Click below to jump straight to it:",
+            view=make_jump_view("Jump to Your Ticket Thread", jump_url),
         )
 
     async def _handle_submission_flow(self, interaction: discord.Interaction, chore: dict, week: str):
         if chore["thread_id"]:
-            thread = interaction.guild.get_thread(chore["thread_id"]) if interaction.guild else None
-            jump_url = thread.jump_url if thread else f"https://discord.com/channels/{interaction.guild_id}/{chore['thread_id']}"
-            jump_view = discord.ui.View()
-            jump_view.add_item(
-                discord.ui.Button(
-                    label="Jump to Your Ticket Thread",
-                    url=jump_url,
-                    style=discord.ButtonStyle.link,
-                    emoji="🔗",
-                )
+            await self._send_existing_thread_link(
+                interaction, chore["thread_id"], f"#{chore['chore_id']} {chore['title']}"
             )
-            msg = f"📋 **Your thread is already open for #{chore['chore_id']} {chore['title']}!** Click below to jump straight to it:"
-            if interaction.response.is_done():
-                await interaction.followup.send(msg, view=jump_view, ephemeral=True)
-            elif interaction.message is not None:
-                await interaction.response.edit_message(content=msg, view=jump_view)
-            else:
-                await interaction.response.send_message(msg, view=jump_view, ephemeral=True)
             return
 
         partners = await self.bot.db.get_chore_partners(
@@ -315,51 +291,23 @@ class ChoresCog(commands.Cog):
             user_id=interaction.user.id,
         )
 
+        prompt = PartnerPromptView(self.bot, interaction.user.id, chore, partners, week)
         if not partners:
-            prompt = PartnerPromptView(
-                self.bot, interaction.user.id, chore, [], week
-            )
-            await prompt._spawn_thread(
-                interaction, [interaction.user.id], is_shared=False
-            )
+            await prompt._spawn_thread(interaction, [interaction.user.id], is_shared=False)
         else:
-            partner_names = ", ".join(
-                f"**{p['first_name']} {p['last_name']}**" for p in partners
-            )
-            view = PartnerPromptView(
-                self.bot, interaction.user.id, chore, partners, week
-            )
-            msg = (
+            partner_names = ", ".join(f"**{p['first_name']} {p['last_name']}**" for p in partners)
+            await send_or_edit(
+                interaction,
                 f"🤝 You share **{chore['title']}** with {partner_names}.\n"
-                "Are you submitting proof for just yourself, or for both of you?"
+                "Are you submitting proof for just yourself, or for both of you?",
+                view=prompt,
             )
-            if interaction.response.is_done():
-                await interaction.followup.send(msg, view=view, ephemeral=True)
-            elif interaction.message is not None:
-                await interaction.response.edit_message(content=msg, view=view)
-            else:
-                await interaction.response.send_message(msg, view=view, ephemeral=True)
 
     async def _handle_makeup_submission_flow(self, interaction: discord.Interaction, task: dict):
         if task["thread_id"]:
-            thread = interaction.guild.get_thread(task["thread_id"]) if interaction.guild else None
-            jump_url = thread.jump_url if thread else f"https://discord.com/channels/{interaction.guild_id}/{task['thread_id']}"
-            jump_view = discord.ui.View()
-            jump_view.add_item(
-                discord.ui.Button(
-                    label="Jump to Your Ticket Thread",
-                    url=jump_url,
-                    style=discord.ButtonStyle.link,
-                    emoji="🔗",
-                )
+            await self._send_existing_thread_link(
+                interaction, task["thread_id"], f"Makeup #{task['mid']} {task['title']}"
             )
-            msg = f"📋 **Your review thread is already open for Makeup #{task['mid']} {task['title']}!** Click below to jump straight to it:"
-            if interaction.response.is_done():
-                await interaction.followup.send(msg, view=jump_view, ephemeral=True)
-            elif interaction.message is not None:
-                await interaction.response.edit_message(content=msg, view=jump_view)
-            else:
-                await interaction.response.send_message(msg, view=jump_view, ephemeral=True)
             return
 
         if not interaction.response.is_done():
@@ -377,44 +325,25 @@ class ChoresCog(commands.Cog):
             ),
             color=discord.Color.gold(),
         )
-        review_view = ThreadReviewView()
 
         thread, err = await spawn_review_thread(
             interaction=interaction,
             thread_title=thread_name,
             content=f"👋 {interaction.user.mention}",
             embed=embed,
-            view=review_view,
+            view=ThreadReviewView(),
         )
 
         if not thread:
-            err_msg = f"❌ **Could not create makeup submission ticket**:\n{err}"
-            if interaction.response.is_done():
-                await interaction.followup.send(err_msg, ephemeral=True)
-            elif interaction.message is not None:
-                await interaction.response.edit_message(content=err_msg, embed=None, view=None)
-            else:
-                await interaction.response.send_message(err_msg, ephemeral=True)
+            await send_or_edit(interaction, f"❌ **Could not create makeup submission ticket**:\n{err}")
             return
 
         await self.bot.db.link_makeup_thread(task["mid"], thread.id)
-
-        jump_view = discord.ui.View()
-        jump_view.add_item(
-            discord.ui.Button(
-                label=f"Jump to #{thread.name}",
-                url=thread.jump_url,
-                style=discord.ButtonStyle.link,
-                emoji="🚀",
-            )
+        await send_or_edit(
+            interaction,
+            "✅ Makeup bounty ticket created! Click below to upload your photo proof:",
+            view=make_jump_view(f"Jump to #{thread.name}", thread.jump_url, emoji="🚀"),
         )
-        msg_text = "✅ Makeup bounty ticket created! Click below to upload your photo proof:"
-        if interaction.response.is_done():
-            await interaction.followup.send(msg_text, view=jump_view, ephemeral=True)
-        elif interaction.message is not None:
-            await interaction.response.edit_message(content=msg_text, embed=None, view=jump_view)
-        else:
-            await interaction.response.send_message(msg_text, view=jump_view, ephemeral=True)
 
     @app_commands.command(
         name="my_chores",
@@ -422,7 +351,6 @@ class ChoresCog(commands.Cog):
     )
     async def my_chores(self, interaction: discord.Interaction):
         week_str = self._get_current_week()
-
         user = await self.bot.db.get_user(interaction.user.id)
         chores = await self.bot.db.get_user_chores(interaction.user.id, week_str)
         debt = user["missed_chore_hours"] if user else 0
@@ -438,13 +366,8 @@ class ChoresCog(commands.Cog):
         )
 
         if not chores:
-            embed.add_field(
-                name="Assigned Tasks",
-                value="No open chores this week!",
-                inline=False,
-            )
+            embed.add_field(name="Assigned Tasks", value="No open chores this week!", inline=False)
         else:
-            # 24 fields max since Debt Hours takes 1 field (25 max total)
             for c in chores[:24]:
                 status_val = c["status"].upper() if "status" in c.keys() else "PENDING"
                 embed.add_field(

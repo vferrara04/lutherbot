@@ -1,22 +1,30 @@
 # src/lutherbot/cogs/assignments.py
 from datetime import datetime
-import math
 import discord
-from discord import app_commands
 from discord.ext import commands
 from lutherbot.cogs.helpers import (
-    check_is_manager,
-    has_manager_role,
     format_due_day,
     get_iso_week,
     get_next_week,
     get_prev_week,
+    ensure_user_registered,
+    make_chore_options,
+    make_jump_view,
+    PaginatedDashboardView,
     PaginatedSelectView,
 )
 
 
 class CustomRolloverModal(discord.ui.Modal, title="Custom Week Rollover"):
-    def __init__(self, bot: commands.Bot, parent_view: "WeeklyAssignmentsView", default_old: str, default_new: str, dashboard_message: discord.Message | None = None):
+
+    def __init__(
+        self,
+        bot: commands.Bot,
+        parent_view: "WeeklyAssignmentsView",
+        default_old: str,
+        default_new: str,
+        dashboard_message: discord.Message | None = None,
+    ):
         super().__init__()
         self.bot = bot
         self.parent_view = parent_view
@@ -39,34 +47,15 @@ class CustomRolloverModal(discord.ui.Modal, title="Custom Week Rollover"):
     async def on_submit(self, interaction: discord.Interaction):
         old_w = self.old_week_input.value.strip().upper()
         new_w = self.new_week_input.value.strip().upper()
-        await interaction.response.defer(ephemeral=True)
-
-        count = await self.bot.db.process_weekly_rollover(old_w, new_w)
-        embed = discord.Embed(
-            title="🎉 Week Rolled Over Successfully!",
-            description=(
-                f"• **Finalized Week**: `{old_w}`\n"
-                f"  *(Unfinished chores recorded as missed debt)*\n"
-                f"• **Active New Week**: `{new_w}`\n"
-                f"• **Assignments Provisioned**: **{count}** tasks"
-            ),
-            color=discord.Color.green(),
-            timestamp=datetime.utcnow(),
+        await interaction.parent_view._execute_rollover(
+            interaction, old_w, new_w, self.dashboard_message
+        ) if hasattr(interaction, "parent_view") else await self.parent_view._execute_rollover(
+            interaction, old_w, new_w, self.dashboard_message
         )
-        await interaction.followup.send(embed=embed, ephemeral=True)
-        if self.parent_view:
-            self.parent_view.week = new_w
-            self.parent_view.page = 0
-            new_embed = await self.parent_view.build_assignments_embed()
-            target_msg = self.dashboard_message or interaction.message
-            if target_msg:
-                try:
-                    await target_msg.edit(embed=new_embed, view=self.parent_view)
-                except discord.HTTPException:
-                    pass
 
 
 class EditDebtModal(discord.ui.Modal):
+
     def __init__(self, bot: commands.Bot, user_id: int, user_data: dict):
         first = user_data.get("first_name", "")
         last = user_data.get("last_name", "")
@@ -104,9 +93,7 @@ class EditDebtModal(discord.ui.Modal):
         old_hours = self.user_data.get("missed_chore_hours", 0)
         await self.bot.db.set_user_missed_hours(self.user_id, new_hours)
 
-        first = self.user_data.get("first_name", "")
-        last = self.user_data.get("last_name", "")
-        name = f"{first} {last}".strip()
+        name = f"{self.user_data.get('first_name', '')} {self.user_data.get('last_name', '')}".strip()
         reason = self.reason_input.value.strip() or "Manager adjustment"
 
         embed = discord.Embed(
@@ -123,31 +110,18 @@ class EditDebtModal(discord.ui.Modal):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-class WeeklyAssignmentsView(discord.ui.View):
+class WeeklyAssignmentsView(PaginatedDashboardView):
     """Interactive manager dashboard to view, reassign, force approve, or delete weekly chores."""
 
     def __init__(self, bot: commands.Bot, week: str | None = None):
-        super().__init__(timeout=None)
-        self.bot = bot
+        super().__init__(bot=bot, per_page=15, manager_only=True, timeout=None)
         self.week = week or get_iso_week()
-        self.page = 0
-        self.per_page = 15  # 15 housemates per page (well below Discord's 25-field limit)
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if not check_is_manager(interaction.user, interaction.guild):
-            await interaction.response.send_message(
-                "⛔ **Restricted**: Only members with the **Manager** role can modify chore assignments.",
-                ephemeral=True,
-            )
-            return False
-        return True
 
     def _get_current_week(self) -> str:
         return self.week or get_iso_week()
 
-    def _update_nav_buttons(self, total_pages: int):
-        self.prev_page_btn.disabled = self.page <= 0
-        self.next_page_btn.disabled = self.page >= total_pages - 1
+    async def build_embed(self, interaction: discord.Interaction | None = None) -> discord.Embed:
+        return await self.build_assignments_embed()
 
     async def build_assignments_embed(self) -> discord.Embed:
         week = self._get_current_week()
@@ -164,8 +138,7 @@ class WeeklyAssignmentsView(discord.ui.View):
         )
 
         if not rows:
-            self.page = 0
-            self._update_nav_buttons(1)
+            self.paginate([])
             embed.description = f"```\nNo chore assignments found for week {week}. Use 'Assign Task' or weekly rollover.\n```"
             return embed
 
@@ -177,37 +150,56 @@ class WeeklyAssignmentsView(discord.ui.View):
             "missed": "⚠️ MISSED",
         }
 
-        # Group assignments by housemate
         member_map: dict[str, list[str]] = {}
         for r in rows:
             member_name = f"{r['first_name']} {r['last_name']}"
-            stat = status_emojis.get(r['status'], r['status'].upper())
+            stat = status_emojis.get(r["status"], r["status"].upper())
             day_text = f"Due: {format_due_day(r['due_day'])}"
             item_line = f"• **{r['title']}** (`{r['hours']}h`) — `{stat}` ({day_text})"
             member_map.setdefault(member_name, []).append(item_line)
 
-        members_list = list(member_map.items())
-        total_pages = max(1, math.ceil(len(members_list) / self.per_page))
-        self.page = max(0, min(self.page, total_pages - 1))
-        self._update_nav_buttons(total_pages)
-
-        start = self.page * self.per_page
-        page_members = members_list[start : start + self.per_page]
+        page_members, total_pages = self.paginate(list(member_map.items()))
 
         for member, chore_lines in page_members:
             val_str = "\n".join(chore_lines)
             if len(val_str) > 1020:
                 val_str = val_str[:1015] + "\n..."
-            embed.add_field(
-                name=f"👤 {member}",
-                value=val_str,
-                inline=False,
-            )
+            embed.add_field(name=f"👤 {member}", value=val_str, inline=False)
 
         embed.set_footer(
             text=f"Page {self.page + 1}/{total_pages} • Total active assignments: {len(rows)} • Managers only"
         )
         return embed
+
+    @staticmethod
+    def _make_assignment_options(rows: list, desc_fn) -> list[discord.SelectOption]:
+        return [
+            discord.SelectOption(
+                label=f"{r['first_name']}: {r['title'][:25]}",
+                value=f"{r['cid']}:{r['uid']}",
+                description=desc_fn(r)[:100],
+            )
+            for r in rows
+        ]
+
+    async def _prompt_user_select(
+        self,
+        interaction: discord.Interaction,
+        prompt_text: str,
+        placeholder: str,
+        on_user_picked,
+    ):
+        view = discord.ui.View(timeout=60)
+        user_select = discord.ui.UserSelect(placeholder=placeholder, min_values=1, max_values=1)
+
+        async def _cb(s_inter: discord.Interaction):
+            target = user_select.values[0]
+            await ensure_user_registered(self.bot.db, target)
+            await on_user_picked(s_inter, target)
+
+        user_select.callback = _cb
+        view.add_item(user_select)
+        await interaction.response.edit_message(content=prompt_text, view=view)
 
     # --- ROW 0: Task Management ---
 
@@ -218,9 +210,7 @@ class WeeklyAssignmentsView(discord.ui.View):
         custom_id="weekly_mgr_reassign",
         row=0,
     )
-    async def reassign_btn(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
+    async def reassign_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         week = self._get_current_week()
         rows = await self.bot.db.get_weekly_assignments_detailed(week)
         if not rows:
@@ -228,64 +218,31 @@ class WeeklyAssignmentsView(discord.ui.View):
             return
 
         dashboard_msg = interaction.message
-        options = [
-            discord.SelectOption(
-                label=f"{r['first_name']}: {r['title'][:25]}",
-                value=f"{r['cid']}:{r['uid']}",
-                description=f"{r['hours']}h • Status: {r['status']}",
-            )
-            for r in rows
-        ]
+        options = self._make_assignment_options(rows, lambda r: f"{r['hours']}h • Status: {r['status']}")
 
         async def assignment_picked(s1_inter: discord.Interaction, selected_val: str):
-            cid_str, old_uid_str = selected_val.split(":")
-            cid = int(cid_str)
-            old_uid = int(old_uid_str)
+            cid, old_uid = map(int, selected_val.split(":"))
             chore = await self.bot.db.get_chore(cid)
 
-            step2_view = discord.ui.View(timeout=60)
-            user_select = discord.ui.UserSelect(
-                placeholder="Step 2: Pick the new housemate to receive this chore...",
-                min_values=1,
-                max_values=1,
-            )
-
-            async def new_user_picked(s2_inter: discord.Interaction):
-                new_member = user_select.values[0]
-
-                db_user = await self.bot.db.get_user(new_member.id)
-                if not db_user:
-                    parts = new_member.display_name.split()
-                    f_name = parts[0] if parts else new_member.name
-                    l_name = " ".join(parts[1:]) if len(parts) > 1 else ""
-                    await self.bot.db.upsert_user(new_member.id, f_name, l_name, 0)
-
+            async def on_new_user(s2_inter: discord.Interaction, new_member: discord.Member):
                 await self.bot.db.reassign_chore(old_uid, new_member.id, cid, week)
                 await s2_inter.response.edit_message(
                     content=f"✅ Reassigned **{chore['title']}** to {new_member.mention} for week `{week}`!",
                     view=None,
                 )
-                new_embed = await self.build_assignments_embed()
                 if dashboard_msg:
-                    await dashboard_msg.edit(embed=new_embed, view=self)
+                    await dashboard_msg.edit(embed=await self.build_assignments_embed(), view=self)
 
-            user_select.callback = new_user_picked
-            step2_view.add_item(user_select)
-
-            await s1_inter.response.edit_message(
-                content=f"Reassigning **{chore['title']}** ({chore['hours']}h). Who should get this chore?",
-                view=step2_view,
+            await self._prompt_user_select(
+                s1_inter,
+                f"Reassigning **{chore['title']}** ({chore['hours']}h). Who should get this chore?",
+                "Step 2: Pick the new housemate to receive this chore...",
+                on_new_user,
             )
-
-        step1_view = PaginatedSelectView(
-            options=options,
-            placeholder="Step 1: Select the assignment to move...",
-            on_select=assignment_picked,
-        )
 
         await interaction.response.send_message(
             "Select which housemate's assignment you want to change:",
-            view=step1_view,
+            view=PaginatedSelectView(options, "Step 1: Select the assignment to move...", assignment_picked),
             ephemeral=True,
         )
 
@@ -296,9 +253,7 @@ class WeeklyAssignmentsView(discord.ui.View):
         custom_id="weekly_mgr_status",
         row=0,
     )
-    async def edit_status_btn(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
+    async def edit_status_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         week = self._get_current_week()
         rows = await self.bot.db.get_weekly_assignments_detailed(week)
         if not rows:
@@ -306,19 +261,10 @@ class WeeklyAssignmentsView(discord.ui.View):
             return
 
         dashboard_msg = interaction.message
-        options = [
-            discord.SelectOption(
-                label=f"{r['first_name']}: {r['title'][:25]}",
-                value=f"{r['cid']}:{r['uid']}",
-                description=f"Current: {r['status']}",
-            )
-            for r in rows
-        ]
+        options = self._make_assignment_options(rows, lambda r: f"Current: {r['status']}")
 
         async def assignment_picked(s1_inter: discord.Interaction, selected_val: str):
-            cid_str, uid_str = selected_val.split(":")
-            cid = int(cid_str)
-            uid = int(uid_str)
+            cid, uid = map(int, selected_val.split(":"))
             chore = await self.bot.db.get_chore(cid)
 
             status_view = discord.ui.View(timeout=60)
@@ -340,27 +286,19 @@ class WeeklyAssignmentsView(discord.ui.View):
                     content=f"✅ Updated status of **{chore['title']}** to `{new_stat.upper()}`!",
                     view=None,
                 )
-                new_embed = await self.build_assignments_embed()
                 if dashboard_msg:
-                    await dashboard_msg.edit(embed=new_embed, view=self)
+                    await dashboard_msg.edit(embed=await self.build_assignments_embed(), view=self)
 
             status_select.callback = status_picked
             status_view.add_item(status_select)
-
             await s1_inter.response.edit_message(
                 content=f"Change status for **{chore['title']}**:",
                 view=status_view,
             )
 
-        step1_view = PaginatedSelectView(
-            options=options,
-            placeholder="Select assignment to change status...",
-            on_select=assignment_picked,
-        )
-
         await interaction.response.send_message(
             "Select an assignment to change status:",
-            view=step1_view,
+            view=PaginatedSelectView(options, "Select assignment to change status...", assignment_picked),
             ephemeral=True,
         )
 
@@ -371,72 +309,39 @@ class WeeklyAssignmentsView(discord.ui.View):
         custom_id="weekly_mgr_add_task",
         row=0,
     )
-    async def add_task_btn(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
+    async def add_task_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         chores = await self.bot.db.get_all_chores()
         if not chores:
             await interaction.response.send_message("❌ No master chores available.", ephemeral=True)
             return
 
         dashboard_msg = interaction.message
-        options = [
-            discord.SelectOption(
-                label=f"#{c['cid']} {c['title'][:40]}",
-                value=str(c["cid"]),
-                description=f"{c['hours']}h credit • Due: {format_due_day(c['due_day'])}",
-            )
-            for c in chores
-        ]
 
         async def chore_picked(s1_inter: discord.Interaction, selected_val: str):
             cid = int(selected_val)
             chore = await self.bot.db.get_chore(cid)
             week = self._get_current_week()
 
-            step2_view = discord.ui.View(timeout=60)
-            user_select = discord.ui.UserSelect(
-                placeholder="Step 2: Pick housemate to receive chore...",
-                min_values=1,
-                max_values=1,
-            )
-
-            async def user_picked(s2_inter: discord.Interaction):
-                target_user = user_select.values[0]
-                db_user = await self.bot.db.get_user(target_user.id)
-                if not db_user:
-                    parts = target_user.display_name.split()
-                    f_name = parts[0] if parts else target_user.name
-                    l_name = " ".join(parts[1:]) if len(parts) > 1 else ""
-                    await self.bot.db.upsert_user(target_user.id, f_name, l_name, 0)
-
+            async def on_user(s2_inter: discord.Interaction, target_user: discord.Member):
                 await self.bot.db.assign_chore(cid, target_user.id, week)
                 await self.bot.db.add_chore_template(cid, target_user.id)
                 await s2_inter.response.edit_message(
                     content=f"✅ Assigned **{chore['title']}** to {target_user.mention} for week `{week}`!",
                     view=None,
                 )
-                new_embed = await self.build_assignments_embed()
                 if dashboard_msg:
-                    await dashboard_msg.edit(embed=new_embed, view=self)
+                    await dashboard_msg.edit(embed=await self.build_assignments_embed(), view=self)
 
-            user_select.callback = user_picked
-            step2_view.add_item(user_select)
-
-            await s1_inter.response.edit_message(
-                content=f"Assigning **{chore['title']}** ({chore['hours']}h). Who gets this chore?",
-                view=step2_view,
+            await self._prompt_user_select(
+                s1_inter,
+                f"Assigning **{chore['title']}** ({chore['hours']}h). Who gets this chore?",
+                "Step 2: Pick housemate to receive chore...",
+                on_user,
             )
-
-        step1_view = PaginatedSelectView(
-            options=options,
-            placeholder="Step 1: Pick chore to assign...",
-            on_select=chore_picked,
-        )
 
         await interaction.response.send_message(
             "Assign a chore for this week:",
-            view=step1_view,
+            view=PaginatedSelectView(make_chore_options(chores), "Step 1: Pick chore to assign...", chore_picked),
             ephemeral=True,
         )
 
@@ -447,9 +352,7 @@ class WeeklyAssignmentsView(discord.ui.View):
         custom_id="weekly_mgr_remove_task",
         row=0,
     )
-    async def remove_task_btn(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
+    async def remove_task_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         week = self._get_current_week()
         rows = await self.bot.db.get_weekly_assignments_detailed(week)
         if not rows:
@@ -457,39 +360,22 @@ class WeeklyAssignmentsView(discord.ui.View):
             return
 
         dashboard_msg = interaction.message
-        options = [
-            discord.SelectOption(
-                label=f"{r['first_name']}: {r['title'][:25]}",
-                value=f"{r['cid']}:{r['uid']}",
-                description=f"Remove from week {week}",
-            )
-            for r in rows
-        ]
+        options = self._make_assignment_options(rows, lambda _: f"Remove from week {week}")
 
         async def remove_picked(s_inter: discord.Interaction, selected_val: str):
-            cid_str, uid_str = selected_val.split(":")
-            cid = int(cid_str)
-            uid = int(uid_str)
+            cid, uid = map(int, selected_val.split(":"))
             chore = await self.bot.db.get_chore(cid)
-
             await self.bot.db.delete_assignment(cid, uid, week)
             await s_inter.response.edit_message(
                 content=f"🗑️ Removed assignment **{chore['title']}** from <@{uid}> for week `{week}`.",
                 view=None,
             )
-            new_embed = await self.build_assignments_embed()
             if dashboard_msg:
-                await dashboard_msg.edit(embed=new_embed, view=self)
-
-        select_view = PaginatedSelectView(
-            options=options,
-            placeholder="Select assignment to remove from this week...",
-            on_select=remove_picked,
-        )
+                await dashboard_msg.edit(embed=await self.build_assignments_embed(), view=self)
 
         await interaction.response.send_message(
             "Select an assignment to remove:",
-            view=select_view,
+            view=PaginatedSelectView(options, "Select assignment to remove from this week...", remove_picked),
             ephemeral=True,
         )
 
@@ -500,23 +386,41 @@ class WeeklyAssignmentsView(discord.ui.View):
         custom_id="weekly_mgr_makeups",
         row=0,
     )
-    async def makeups_dashboard_btn(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        if not check_is_manager(interaction.user, interaction.guild):
-            await interaction.response.send_message(
-                "⛔ **Restricted**: Only members with the **Manager** role can open makeup bounties.",
-                ephemeral=True,
-            )
-            return
-
+    async def makeups_dashboard_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         from lutherbot.cogs.makeups import MakeupDashboardView
-        current_w = self._get_current_week()
-        view = MakeupDashboardView(self.bot, week=current_w)
+        view = MakeupDashboardView(self.bot, week=self._get_current_week())
         embed = await view.build_dashboard_embed()
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     # --- ROW 1: Admin & Rollover Controls ---
+
+    async def _execute_rollover(
+        self,
+        interaction: discord.Interaction,
+        old_w: str,
+        new_w: str,
+        dashboard_msg: discord.Message | None,
+    ):
+        await interaction.response.defer(ephemeral=True)
+        count = await self.bot.db.process_weekly_rollover(old_w, new_w)
+        self.week = new_w
+        self.page = 0
+        result_embed = discord.Embed(
+            title="🎉 Week Rolled Over Successfully!",
+            description=(
+                f"• **Finalized Week**: `{old_w}` (uncompleted chores recorded as missed debt)\n"
+                f"• **Active New Week**: `{new_w}`\n"
+                f"• **Assignments Provisioned**: **{count}** tasks"
+            ),
+            color=discord.Color.green(),
+            timestamp=datetime.utcnow(),
+        )
+        await interaction.followup.send(embed=result_embed, ephemeral=True)
+        if dashboard_msg:
+            try:
+                await dashboard_msg.edit(embed=await self.build_assignments_embed(), view=self)
+            except discord.HTTPException:
+                pass
 
     @discord.ui.button(
         label="Roll Over Week",
@@ -525,9 +429,7 @@ class WeeklyAssignmentsView(discord.ui.View):
         custom_id="weekly_mgr_rollover",
         row=1,
     )
-    async def rollover_btn(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
+    async def rollover_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         current_week = self._get_current_week()
         next_week = get_next_week(current_week)
         prev_week = get_prev_week(current_week)
@@ -568,28 +470,7 @@ class WeeklyAssignmentsView(discord.ui.View):
             style=discord.ButtonStyle.danger,
             emoji="⏩",
         )
-
-        async def confirm_current_to_next(c_inter: discord.Interaction):
-            await c_inter.response.defer(ephemeral=True)
-            count = await self.bot.db.process_weekly_rollover(current_week, next_week)
-            self.week = next_week
-            self.page = 0
-            result_embed = discord.Embed(
-                title="🎉 Week Rolled Over Successfully!",
-                description=(
-                    f"• **Finalized Week**: `{current_week}` (uncompleted chores recorded as missed debt)\n"
-                    f"• **Active New Week**: `{next_week}`\n"
-                    f"• **Assignments Provisioned**: **{count}** tasks"
-                ),
-                color=discord.Color.green(),
-                timestamp=datetime.utcnow(),
-            )
-            await c_inter.followup.send(embed=result_embed, ephemeral=True)
-            new_embed = await self.build_assignments_embed()
-            if dashboard_msg:
-                await dashboard_msg.edit(embed=new_embed, view=self)
-
-        btn_curr.callback = confirm_current_to_next
+        btn_curr.callback = lambda i: self._execute_rollover(i, current_week, next_week, dashboard_msg)
         confirm_view.add_item(btn_curr)
 
         if missing_prev:
@@ -598,48 +479,16 @@ class WeeklyAssignmentsView(discord.ui.View):
                 style=discord.ButtonStyle.primary,
                 emoji="⏮️",
             )
-
-            async def confirm_prev_to_current(p_inter: discord.Interaction):
-                await p_inter.response.defer(ephemeral=True)
-                count = await self.bot.db.process_weekly_rollover(prev_week, current_week)
-                self.week = current_week
-                self.page = 0
-                result_embed = discord.Embed(
-                    title="🎉 Previous Week Finalized!",
-                    description=(
-                        f"• **Finalized Week**: `{prev_week}`\n"
-                        f"• **Current Week**: `{current_week}`\n"
-                        f"• **Assignments Provisioned**: **{count}** tasks"
-                    ),
-                    color=discord.Color.green(),
-                    timestamp=datetime.utcnow(),
-                )
-                await p_inter.followup.send(embed=result_embed, ephemeral=True)
-                new_embed = await self.build_assignments_embed()
-                if dashboard_msg:
-                    await dashboard_msg.edit(embed=new_embed, view=self)
-
-            btn_prev.callback = confirm_prev_to_current
+            btn_prev.callback = lambda i: self._execute_rollover(i, prev_week, current_week, dashboard_msg)
             confirm_view.add_item(btn_prev)
 
-        btn_custom = discord.ui.Button(
-            label="Custom Weeks...",
-            style=discord.ButtonStyle.secondary,
-            emoji="⚙️",
+        btn_custom = discord.ui.Button(label="Custom Weeks...", style=discord.ButtonStyle.secondary, emoji="⚙️")
+        btn_custom.callback = lambda i: i.response.send_modal(
+            CustomRolloverModal(self.bot, self, current_week, next_week, dashboard_message=dashboard_msg)
         )
-
-        async def custom_weeks_clicked(cust_inter: discord.Interaction):
-            modal = CustomRolloverModal(self.bot, self, current_week, next_week, dashboard_message=dashboard_msg)
-            await cust_inter.response.send_modal(modal)
-
-        btn_custom.callback = custom_weeks_clicked
         confirm_view.add_item(btn_custom)
 
-        await interaction.response.send_message(
-            embed=confirm_embed,
-            view=confirm_view,
-            ephemeral=True,
-        )
+        await interaction.response.send_message(embed=confirm_embed, view=confirm_view, ephemeral=True)
 
     @discord.ui.button(
         label="Pending Reviews",
@@ -648,9 +497,7 @@ class WeeklyAssignmentsView(discord.ui.View):
         custom_id="weekly_mgr_pending_threads",
         row=1,
     )
-    async def pending_threads_btn(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
+    async def pending_threads_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._show_pending_reviews(interaction)
 
     @discord.ui.button(
@@ -660,9 +507,7 @@ class WeeklyAssignmentsView(discord.ui.View):
         custom_id="weekly_mgr_edit_hours",
         row=1,
     )
-    async def edit_hours_btn(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
+    async def edit_hours_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         users = await self.bot.db.get_all_users()
         if not users:
             await interaction.response.send_message("❌ No housemates registered in the roster.", ephemeral=True)
@@ -680,18 +525,11 @@ class WeeklyAssignmentsView(discord.ui.View):
         async def user_selected(s_inter: discord.Interaction, selected_val: str):
             selected_uid = int(selected_val)
             user_data = await self.bot.db.get_user(selected_uid)
-            modal = EditDebtModal(self.bot, selected_uid, dict(user_data))
-            await s_inter.response.send_modal(modal)
-
-        pick_view = PaginatedSelectView(
-            options=options,
-            placeholder="Select housemate to edit debt hours...",
-            on_select=user_selected,
-        )
+            await s_inter.response.send_modal(EditDebtModal(self.bot, selected_uid, dict(user_data)))
 
         await interaction.response.send_message(
             "Select which housemate's missed hours debt you want to adjust:",
-            view=pick_view,
+            view=PaginatedSelectView(options, "Select housemate to edit debt hours...", user_selected),
             ephemeral=True,
         )
 
@@ -702,11 +540,8 @@ class WeeklyAssignmentsView(discord.ui.View):
         custom_id="weekly_mgr_refresh",
         row=1,
     )
-    async def refresh_btn(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        new_embed = await self.build_assignments_embed()
-        await interaction.response.edit_message(embed=new_embed, view=self)
+    async def refresh_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._refresh_display(interaction)
 
     # --- ROW 2: Dashboard Pagination ---
 
@@ -716,13 +551,8 @@ class WeeklyAssignmentsView(discord.ui.View):
         custom_id="weekly_mgr_prev_page",
         row=2,
     )
-    async def prev_page_btn(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        if self.page > 0:
-            self.page -= 1
-        new_embed = await self.build_assignments_embed()
-        await interaction.response.edit_message(embed=new_embed, view=self)
+    async def prev_page_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._turn_page(interaction, -1)
 
     @discord.ui.button(
         label="Next ▶",
@@ -730,12 +560,8 @@ class WeeklyAssignmentsView(discord.ui.View):
         custom_id="weekly_mgr_next_page",
         row=2,
     )
-    async def next_page_btn(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        self.page += 1
-        new_embed = await self.build_assignments_embed()
-        await interaction.response.edit_message(embed=new_embed, view=self)
+    async def next_page_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._turn_page(interaction, 1)
 
     async def _show_pending_reviews(self, interaction: discord.Interaction):
         rows = await self.bot.db.get_pending_threads()
@@ -757,56 +583,38 @@ class WeeklyAssignmentsView(discord.ui.View):
             timestamp=datetime.utcnow(),
         )
 
-        # Capped at 25 fields for the embed, while PaginatedSelectView holds all options
         for i, r in enumerate(rows[:25]):
             type_label = "Bounty" if r["chore_type"] == "makeup" else "Chore"
-            thread_mention = f"<#{r['thread_id']}>"
             status_text = r["status"].replace("_", " ").upper()
             embed.add_field(
                 name=f"{i+1}. {r['first_name']} {r['last_name']} — {r['title']} ({r['hours']}h)",
-                value=f"Type: `{type_label}` | Week: `{r['week']}` | Status: `{status_text}`\nThread: {thread_mention}",
+                value=f"Type: `{type_label}` | Week: `{r['week']}` | Status: `{status_text}`\nThread: <#{r['thread_id']}>",
                 inline=False,
             )
 
         if len(rows) > 25:
             embed.set_footer(text=f"Showing top 25 of {len(rows)} in embed. Use the dropdown below to browse all {len(rows)} threads.")
 
-        options = []
-        for r in rows:
-            type_label = "Bounty" if r["chore_type"] == "makeup" else "Chore"
-            options.append(
-                discord.SelectOption(
-                    label=f"{r['first_name']}: {r['title'][:25]}",
-                    value=str(r["thread_id"]),
-                    description=f"{type_label} • {r['hours']}h • Week {r['week']}",
-                )
+        options = [
+            discord.SelectOption(
+                label=f"{r['first_name']}: {r['title'][:25]}",
+                value=str(r["thread_id"]),
+                description=f"{'Bounty' if r['chore_type'] == 'makeup' else 'Chore'} • {r['hours']}h • Week {r['week']}",
             )
+            for r in rows
+        ]
 
         async def select_thread(s_inter: discord.Interaction, selected_val: str):
             thread_id = int(selected_val)
             thread = interaction.guild.get_thread(thread_id) if interaction.guild else None
             jump_url = thread.jump_url if thread else f"https://discord.com/channels/{interaction.guild_id}/{thread_id}"
-            jump_view = discord.ui.View()
-            jump_view.add_item(
-                discord.ui.Button(
-                    label="Jump to Review Thread",
-                    url=jump_url,
-                    style=discord.ButtonStyle.link,
-                    emoji="🔗",
-                )
-            )
             await s_inter.response.send_message(
                 f"🔗 Direct link to review thread <#{thread_id}>:",
-                view=jump_view,
+                view=make_jump_view("Jump to Review Thread", jump_url),
                 ephemeral=True,
             )
 
-        view = PaginatedSelectView(
-            options=options,
-            placeholder="Select a review thread to jump to...",
-            on_select=select_thread,
-        )
-
+        view = PaginatedSelectView(options, "Select a review thread to jump to...", select_thread)
         if interaction.response.is_done():
             await interaction.followup.send(embed=embed, view=view, ephemeral=True)
         else:

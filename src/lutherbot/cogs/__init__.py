@@ -9,9 +9,11 @@ from lutherbot.cogs.helpers import (
     get_prev_week,
     check_is_manager,
     has_manager_role,
+    PaginatedDashboardView,
+    PaginatedSelectView,
 )
 from lutherbot.cogs.reviews import ThreadReviewView, spawn_review_thread
-from lutherbot.cogs.modals import AddChoreModal, EditChoreModal
+from lutherbot.cogs.modals import ChoreModal, AddChoreModal, EditChoreModal
 from lutherbot.cogs.chore_views import PartnerPromptView, ChoreManagerView
 from lutherbot.cogs.assignments import WeeklyAssignmentsView, CustomRolloverModal, EditDebtModal
 from lutherbot.cogs.makeups import MakeupBoardView, MakeupDashboardView
@@ -26,12 +28,14 @@ __all__ = [
     "get_prev_week",
     "check_is_manager",
     "has_manager_role",
+    "PaginatedDashboardView",
+    "PaginatedSelectView",
     "ThreadReviewView",
     "spawn_review_thread",
+    "ChoreModal",
     "AddChoreModal",
     "EditChoreModal",
     "PartnerPromptView",
-    "ChoreDashboardView",
     "ChoreManagerView",
     "WeeklyAssignmentsView",
     "CustomRolloverModal",

@@ -5,17 +5,19 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from lutherbot import config
-from lutherbot.cogs.helpers import has_manager_role, get_or_fetch_channel
+from lutherbot.cogs.helpers import (
+    has_manager_role,
+    get_or_fetch_channel,
+    post_dashboard_to_channel,
+    PaginatedDashboardView,
+)
 
 
 def has_food_role():
     """Restricts command execution strictly to members with the Food role."""
-
     async def predicate(interaction: discord.Interaction) -> bool:
         if config.FOOD_ROLE_ID:
-            has_role = any(
-                r.id == config.FOOD_ROLE_ID for r in interaction.user.roles
-            )
+            has_role = any(r.id == config.FOOD_ROLE_ID for r in interaction.user.roles)
         else:
             has_role = any(
                 r.name.lower() in ("food", "food manager", "food team", "admin")
@@ -31,11 +33,6 @@ def has_food_role():
         return True
 
     return app_commands.check(predicate)
-
-
-# =============================================================================
-# 1. Add Item Popup Modal
-# =============================================================================
 
 
 class AddItemModal(discord.ui.Modal, title="Add to House Shopping List"):
@@ -57,7 +54,6 @@ class AddItemModal(discord.ui.Modal, title="Add to House Shopping List"):
         self.board_view = board_view
 
     async def on_submit(self, interaction: discord.Interaction):
-        # 1. Insert item into SQLite
         await self.bot.db.add_shopping_item(
             guild_id=interaction.guild_id or 0,
             item_name=self.item_name.value.strip(),
@@ -65,33 +61,27 @@ class AddItemModal(discord.ui.Modal, title="Add to House Shopping List"):
             requested_by=interaction.user.id,
         )
 
-        # 2. Confirm to the user ephemerally
         await interaction.response.send_message(
             f"✅ Added **{self.item_name.value}** (`{self.quantity.value}`) to the list!",
             ephemeral=True,
         )
 
-        # 3. Update the public board message in place
         if interaction.message:
-            new_embed = await self.board_view.build_shopping_embed(
-                interaction.guild_id or 0
-            )
+            new_embed = await self.board_view.build_shopping_embed(interaction.guild_id or 0)
             await interaction.message.edit(embed=new_embed, view=self.board_view)
 
 
-# =============================================================================
-# 2. Streamlined Shopping Board View
-# =============================================================================
-
-
-class ShoppingBoardView(discord.ui.View):
-    """Persistent dashboard containing only Add and Refresh controls."""
+class ShoppingBoardView(PaginatedDashboardView):
+    """Persistent dashboard containing Add, Refresh, and Pagination controls."""
 
     def __init__(self, bot: commands.Bot):
-        super().__init__(timeout=None)
-        self.bot = bot
+        super().__init__(bot=bot, per_page=30, manager_only=False, timeout=None)
 
-    async def build_shopping_embed(self, guild_id: int) -> discord.Embed:
+    async def build_embed(self, interaction: discord.Interaction | None = None) -> discord.Embed:
+        guild_id = interaction.guild_id if interaction and interaction.guild_id else 0
+        return await self.build_shopping_embed(guild_id)
+
+    async def build_shopping_embed(self, guild_id: int = 0) -> discord.Embed:
         query = """
             SELECT s.item_name, s.quantity, u.first_name
             FROM shopping_items s
@@ -108,6 +98,7 @@ class ShoppingBoardView(discord.ui.View):
             timestamp=datetime.utcnow(),
         )
 
+        chunk, total_pages = self.paginate(items)
         if not items:
             embed.description = (
                 "```text\nAll stocked up! No items requested right now.\n```\n"
@@ -115,32 +106,20 @@ class ShoppingBoardView(discord.ui.View):
             )
             return embed
 
-        # Monospace spreadsheet layout: Item (20) | Qty (10) | Requested By (12)
         lines = [
             f"{'Item':<20} | {'Qty':<10} | {'Requested By':<12}",
             "-" * 48,
         ]
 
-        for it in items:
-            name = (
-                it["item_name"][:19]
-                if len(it["item_name"]) > 19
-                else it["item_name"]
-            )
-            qty = (
-                it["quantity"][:9]
-                if len(it["quantity"]) > 9
-                else it["quantity"]
-            )
-            requester = it["first_name"] or "Unknown"
-            requester = requester[:12]
-
+        for it in chunk:
+            name = it["item_name"][:19]
+            qty = it["quantity"][:9]
+            requester = (it["first_name"] or "Unknown")[:12]
             lines.append(f"{name:<20} | {qty:<10} | {requester:<12}")
 
-        table_text = "\n".join(lines)
         embed.description = (
-            f"```text\n{table_text}\n```\n"
-            f"*Total items pending: **{len(items)}***"
+            f"```text\n{chr(10).join(lines)}\n```\n"
+            f"*Page {self.page + 1}/{total_pages} • Total items pending: **{len(items)}***"
         )
         embed.set_footer(text="Auto-clears when exported by the food manager")
         return embed
@@ -150,10 +129,9 @@ class ShoppingBoardView(discord.ui.View):
         style=discord.ButtonStyle.success,
         emoji="➕",
         custom_id="shop_btn_add_item",
+        row=0,
     )
-    async def add_item_click(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
+    async def add_item_click(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(AddItemModal(self.bot, self))
 
     @discord.ui.button(
@@ -161,24 +139,34 @@ class ShoppingBoardView(discord.ui.View):
         style=discord.ButtonStyle.secondary,
         emoji="🔄",
         custom_id="shop_btn_refresh_board",
+        row=0,
     )
-    async def refresh_click(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        new_embed = await self.build_shopping_embed(interaction.guild_id or 0)
-        await interaction.response.edit_message(embed=new_embed, view=self)
+    async def refresh_click(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._refresh_display(interaction)
 
+    @discord.ui.button(
+        label="◀ Prev",
+        style=discord.ButtonStyle.secondary,
+        custom_id="shop_btn_prev_page",
+        row=0,
+    )
+    async def prev_page_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._turn_page(interaction, -1)
 
-# =============================================================================
-# 3. Cog Definition & Export Command
-# =============================================================================
+    @discord.ui.button(
+        label="Next ▶",
+        style=discord.ButtonStyle.secondary,
+        custom_id="shop_btn_next_page",
+        row=0,
+    )
+    async def next_page_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._turn_page(interaction, 1)
 
 
 class ShoppingCog(commands.Cog):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-    
 
     @app_commands.command(
         name="post_shopping_list",
@@ -186,16 +174,14 @@ class ShoppingCog(commands.Cog):
     )
     @has_manager_role()
     async def post_shopping_list(self, interaction: discord.Interaction):
-        print(
-        f"DEBUG: FOOD_REQUEST_CHANNEL_ID is {config.FOOD_REQUEST_CHANNEL_ID} (type: {type(config.FOOD_REQUEST_CHANNEL_ID)})"
-        )
-        food_request_channel = await get_or_fetch_channel(self.bot, config.FOOD_REQUEST_CHANNEL_ID)
-        await interaction.response.defer(ephemeral=True)
         view = ShoppingBoardView(self.bot)
         embed = await view.build_shopping_embed(interaction.guild_id or 0)
-        await food_request_channel.send(embed=embed, view=view)
-        await interaction.followup.send(
-            "✅ Shopping board posted!", ephemeral=True
+        await post_dashboard_to_channel(
+            interaction,
+            config.FOOD_REQUEST_CHANNEL_ID,
+            view,
+            embed,
+            "✅ Shopping board posted!",
         )
 
     @app_commands.command(
@@ -206,10 +192,7 @@ class ShoppingCog(commands.Cog):
     async def send_shopping_list(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
 
-        # Fetch and archive pending items in SQLite
-        items = await self.bot.db.fetch_and_reset_shopping_list(
-            interaction.guild_id or 0
-        )
+        items = await self.bot.db.fetch_and_reset_shopping_list(interaction.guild_id or 0)
         if not items:
             await interaction.followup.send(
                 "🛒 The shopping list is empty. No new items have been added.",
@@ -217,7 +200,6 @@ class ShoppingCog(commands.Cog):
             )
             return
 
-        # 1. Post batch header in the private food channel
         header_embed = discord.Embed(
             title="🛒 New Grocery Trip Checklist",
             description=(
@@ -229,14 +211,9 @@ class ShoppingCog(commands.Cog):
         food_channel = await get_or_fetch_channel(self.bot, config.FOOD_CHANNEL_ID)
         await food_channel.send(embed=header_embed)
 
-        # 2. Post each item as an individual checklist message
         for it in items:
-            requester = (
-                f" *(req by {it['first_name']})*" if it["first_name"] else ""
-            )
-            msg = await food_channel.send(
-                f"▫️ **{it['item_name']}** — Qty: `{it['quantity']}`{requester}"
-            )
+            requester = f" *(req by {it['first_name']})*" if it["first_name"] else ""
+            msg = await food_channel.send(f"▫️ **{it['item_name']}** — Qty: `{it['quantity']}`{requester}")
             await msg.add_reaction("✅")
             await asyncio.sleep(0.25)
 
@@ -245,58 +222,42 @@ class ShoppingCog(commands.Cog):
             ephemeral=True,
         )
 
-    # =========================================================================
-    # 4. Reaction Strikethrough Listeners
-    # =========================================================================
-
-    @commands.Cog.listener()
-    async def on_raw_reaction_add(
+    async def _get_checklist_message(
         self, payload: discord.RawReactionActionEvent
-    ):
+    ) -> discord.Message | None:
         if payload.user_id == self.bot.user.id:
-            return
+            return None
         if config.FOOD_CHANNEL_ID and payload.channel_id != config.FOOD_CHANNEL_ID:
-            return
+            return None
         if str(payload.emoji) != "✅":
-            return
+            return None
 
         channel = self.bot.get_channel(payload.channel_id)
         if not channel:
-            return
+            return None
 
         try:
-            message = await channel.fetch_message(payload.message_id)
+            return await channel.fetch_message(payload.message_id)
         except discord.NotFound:
-            return
+            return None
 
-        if message.content.startswith("▫️"):
+    @commands.Cog.listener()
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
+        message = await self._get_checklist_message(payload)
+        if message and message.content.startswith("▫️"):
             cleaned = message.content.replace("▫️ ", "").strip()
             await message.edit(content=f"✅ ~~{cleaned}~~")
 
     @commands.Cog.listener()
-    async def on_raw_reaction_remove(
-        self, payload: discord.RawReactionActionEvent
-    ):
-        if config.FOOD_CHANNEL_ID and payload.channel_id != config.FOOD_CHANNEL_ID:
+    async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
+        message = await self._get_checklist_message(payload)
+        if not message:
             return
-        if str(payload.emoji) != "✅":
-            return
-
-        channel = self.bot.get_channel(payload.channel_id)
-        if not channel:
-            return
-
-        try:
-            message = await channel.fetch_message(payload.message_id)
-        except discord.NotFound:
-            return
-
         reaction = discord.utils.get(message.reactions, emoji="✅")
         if reaction and reaction.count <= 1:
             content = message.content
             if content.startswith("✅ ~~") and content.endswith("~~"):
-                restored = content[4:-2]
-                await message.edit(content=f"▫️ {restored}")
+                await message.edit(content=f"▫️ {content[4:-2]}")
 
 
 async def setup(bot: commands.Bot):
