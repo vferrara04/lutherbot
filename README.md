@@ -2,8 +2,6 @@
 
 **LutherBot** is an asynchronous, interactive Discord bot built with `discord.py` and `aiosqlite` designed for co-ops, shared houses, and student living communities. It automates weekly chore scheduling, photo-proof submission tickets, delinquent hour tracking, makeup chore bounties, and communal shopping lists through persistent Discord UI dashboards.
 
----
-
 ## ✨ Features
 
 * **🛠️ Master Chore Templates:** Define standardized house chores with descriptions, credit hours, and due days.
@@ -13,8 +11,6 @@
 * **🛒 Communal Shopping List:** Track needed house supplies and food requests, claim items to purchase, and log receipts/costs.
 * **🎛️ Persistent Interactive Dashboards:** Built with `discord.ui.View` (with `timeout=None`), allowing buttons and paginated dropdown menus to survive bot restarts without losing state.
 
----
-
 ## 📂 Project Architecture
 
 ```text
@@ -22,6 +18,7 @@
 │   └── tracker.db             # Auto-generated SQLite database
 ├── src/
 │   └── lutherbot/
+│       ├── __init__.py
 │       ├── __main__.py        # Package entry point
 │       ├── main.py            # Bot subclass, setup_hook, persistent views & cog loader
 │       ├── config.py          # Environment variable configuration & paths
@@ -38,35 +35,39 @@
 │           ├── shopping.py    # Communal shopping list views & commands
 │           └── users.py       # House roster management commands
 ├── .env                       # Environment variables (not committed)
+├── pyproject.toml             # Project metadata, scripts & dependencies (uv_build)
+├── uv.lock                    # Locked dependency graph managed by uv
 └── README.md
 ```
-
----
 
 ## ⚙️ Prerequisites & Installation
 
 ### 1. Requirements
-* **Python 3.10+**
+
+* **Python `>=3.14`**
+* **[uv](https://docs.astral.sh/uv/)** (Fast Python package and project manager)
 * A Discord Bot Application with **Server Members Intent** and **Message Content Intent** enabled in the [Discord Developer Portal](https://discord.com/developers/applications).
 
-### 2. Install Dependencies
-Clone the repository and install the required packages inside a virtual environment:
+### 2. Install Dependencies with `uv`
+
+Clone the repository and sync the locked virtual environment using `uv`:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-pip install discord.py aiosqlite python-dotenv
+git clone <your-repository-url>
+cd lutherbot
+uv sync
 ```
 
-*(If your project includes a `pyproject.toml` or `requirements.txt`, you can also install it in editable mode via `pip install -e .`)*
-
----
+This automatically provisions a Python `>=3.14` virtual environment (`.venv`) and installs all exact dependencies from `uv.lock`:
+* `discord-py>=2.3.0` (locked at `2.7.1`)
+* `aiosqlite>=0.22.1`
+* `python-dotenv>=1.2.4`
 
 ## 🔐 Configuration (`.env`)
 
 Create a `.env` file in the project root directory and populate it with your Discord server's IDs:
 
-```ini
+```env
 # Bot Credentials
 DISCORD_TOKEN=your_discord_bot_token_here
 GUILD_ID=123456789012345678
@@ -86,39 +87,38 @@ FOOD_REQUEST_CHANNEL_ID=123456789012345678
 
 > **Note:** Setting `GUILD_ID` syncs slash commands instantaneously to your server on startup. If omitted (`0`), commands sync globally (which can take up to an hour on Discord's end).
 
----
-
 ## 🚀 Running the Bot
 
-Run the bot as a Python module from the root/source directory:
+Because `lutherbot` defines a project script entry point (`lutherbot = "lutherbot:main"` in `pyproject.toml`), you can launch it directly with `uv`:
 
 ```bash
-python -m lutherbot
+uv run lutherbot
 ```
 
-Or run `main.py` directly:
+Alternatively, you can run it as a Python module:
 
 ```bash
-python src/lutherbot/main.py
+uv run python -m lutherbot
 ```
 
 On startup, **LutherBot** will automatically:
+
 1. Create the `data/` directory and initialize the SQLite schema in `data/tracker.db`.
 2. Re-register persistent UI views (`ThreadReviewView`, `MakeupBoardView`, `ShoppingBoardView`, `ChoreManagerView`, `WeeklyAssignmentsView`).
 3. Load all feature extensions (`users`, `chores`, `makeups`, `shopping`).
 4. Synchronize application slash commands with Discord.
 
----
-
 ## 📖 Slash Commands Reference
 
 ### 👤 Member Commands
+
 | Command | Description |
 | :--- | :--- |
 | `/my_chores` | View your active weekly chore assignments and current missed chore hour debt. |
 | `/chore_submit` | Open a submission thread (or jump to an existing one) to upload photo proof for an assigned chore or claimed makeup bounty. Supports submitting solo or jointly with a chore partner. |
 
 ### 🛡️ Manager Commands (`WORM_ROLE_ID` or Administrator)
+
 | Command | Description |
 | :--- | :--- |
 | `/chore_manager` | Posts the interactive **Master Chore Templates Manager** dashboard to the manager channel. |
@@ -133,8 +133,6 @@ On startup, **LutherBot** will automatically:
 | `/makeup_post_board` | Posts the public **Open Makeup Chore Bounties** board to `MAKEUP_CHANNEL_ID` for members to claim tasks. |
 | `/makeup_add [chore] [week]` | Adds a master chore template into the available makeup bounty pool for a given week. |
 
----
-
 ## 🗄️ Database Schema Overview
 
 LutherBot uses `aiosqlite` with foreign-key cascading and check constraints across six core tables in `data/tracker.db`:
@@ -144,4 +142,8 @@ LutherBot uses `aiosqlite` with foreign-key cascading and check constraints acro
 * **`chore_templates`**: Maps recurring `(cid, uid)` pairs used to populate new weeks during rollover.
 * **`chore_assignments`**: Tracks weekly instances `(cid, uid, week)` with statuses (`pending`, `under_review`, `missed`, `rejected`, `approved`) and linked Discord `thread_id`.
 * **`makeup_chores`**: Tracks bounty instances (`mid`, `cid`, `uid`, `status`, `thread_id`, `week`). Approving a makeup chore automatically deducts the chore's credit hours from the user's `missed_chore_hours`.
-* **`shopping_items`**: Tracks communal shopping requests (`id`, `item_name`, `quantity`, `requested_by`, `claimed_by`, `cost`, `status`)..
+* **`shopping_items`**: Tracks communal shopping requests (`id`, `item_name`, `quantity`, `requested_by`, `claimed_by`, `cost`, `status`).
+
+## 👤 Author
+
+* **Vincent Ferrara** — [vferrara@umich.edu](mailto:vferrara@umich.edu)
